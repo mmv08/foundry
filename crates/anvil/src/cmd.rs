@@ -99,6 +99,20 @@ pub struct NodeArgs {
     #[arg(long, value_name = "ADDRESS")]
     pub base_activation_admin: Option<Address>,
 
+    /// Enable experimental Monad encrypted transactions, decrypted with an insecure test key.
+    ///
+    /// The optional value is the key's trapdoor, a scalar in [1, q); it defaults to 42, as in
+    /// the SDK's fixtures. Anyone who knows the trapdoor can decrypt every encrypted
+    /// transaction. Requires `--network monad` and cannot be used with forking.
+    #[cfg(feature = "monad")]
+    #[arg(
+        long = "monad.encrypted-transactions",
+        value_name = "TRAPDOOR",
+        num_args(0..=1),
+        default_missing_value = "42"
+    )]
+    pub monad_encrypted_transactions: Option<U256>,
+
     /// Block time in seconds for interval mining.
     #[arg(short, long, visible_alias = "blockTime", value_name = "SECONDS", value_parser = duration_from_secs_f64)]
     pub block_time: Option<Duration>,
@@ -263,6 +277,8 @@ impl NodeArgs {
         let funded_accounts = self.parse_funded_accounts()?;
         #[cfg(feature = "base")]
         let base_activation_admin = self.base_activation_admin;
+        #[cfg(feature = "monad")]
+        let monad_encryption_trapdoor = self.monad_encrypted_transactions;
 
         let local_chain_id = self
             .evm
@@ -358,6 +374,8 @@ impl NodeArgs {
             .with_funded_accounts(funded_accounts);
         #[cfg(feature = "base")]
         let config = config.with_base_activation_admin(base_activation_admin);
+        #[cfg(feature = "monad")]
+        let config = config.with_monad_encryption_trapdoor(monad_encryption_trapdoor);
         Ok(config)
     }
 
@@ -1430,6 +1448,19 @@ mod tests {
         assert_eq!(config.hardfork, None);
         assert_eq!(config.get_hardfork(), foundry_evm::hardfork::MonadHardfork::default().into());
         assert!(config.networks.is_monad());
+    }
+
+    #[test]
+    #[cfg(feature = "monad")]
+    fn can_parse_monad_encrypted_transactions() {
+        for (args, trapdoor) in [
+            (&["anvil", "--network", "monad"][..], None),
+            (&["anvil", "--network", "monad", "--monad.encrypted-transactions"], Some(42)),
+            (&["anvil", "--network", "monad", "--monad.encrypted-transactions", "0x2b"], Some(43)),
+        ] {
+            let config = NodeArgs::parse_from(args).into_node_config().unwrap();
+            assert_eq!(config.monad_encryption_trapdoor, trapdoor.map(U256::from), "{args:?}");
+        }
     }
 
     #[test]

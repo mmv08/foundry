@@ -175,6 +175,8 @@ impl FoundryReceiptBuilder {
                 logs_bloom: receipt.logs_bloom,
             }),
             FoundryTxType::Tempo => FoundryReceiptEnvelope::Tempo(receipt),
+            #[cfg(feature = "monad")]
+            FoundryTxType::Encrypted => FoundryReceiptEnvelope::Encrypted(receipt),
         }
     }
 

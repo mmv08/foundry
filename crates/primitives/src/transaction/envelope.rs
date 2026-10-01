@@ -37,6 +37,9 @@ use op_alloy_consensus::{
     DEPOSIT_TX_TYPE_ID, POST_EXEC_TX_TYPE_ID, PostExecPayload, TxDeposit, TxPostExec,
 };
 
+#[cfg(feature = "monad")]
+use super::{ENCRYPTED_TX_TYPE_ID, TxEncrypted};
+
 //
 /// Container type for signed, typed transactions.
 // NOTE(onbjerg): Boxing `Tempo(AASigned)` breaks `TransactionEnvelope` derive macro trait bounds.
@@ -89,6 +92,10 @@ pub enum FoundryTxEnvelope {
     /// See <https://docs.tempo.xyz/protocol/transactions>.
     #[envelope(ty = 0x76, typed = TempoTransaction)]
     Tempo(AASigned),
+    /// Monad encrypted transaction.
+    #[cfg(feature = "monad")]
+    #[envelope(ty = 8)]
+    Encrypted(Signed<TxEncrypted>),
 }
 
 impl FoundryTxEnvelope {
@@ -160,6 +167,8 @@ impl FoundryTxEnvelope {
             #[cfg(feature = "base")]
             Self::Eip8130(_) => Err(self),
             Self::Tempo(_) => Err(self),
+            #[cfg(feature = "monad")]
+            Self::Encrypted(_) => Err(self),
         }
     }
 
@@ -201,6 +210,12 @@ impl FoundryTxEnvelope {
         matches!(self, Self::Tempo(tx) if !tx.tx().nonce_key.is_zero())
     }
 
+    /// Returns `true` if this is a Monad encrypted transaction.
+    #[cfg(feature = "monad")]
+    pub const fn is_encrypted(&self) -> bool {
+        matches!(self, Self::Encrypted(_))
+    }
+
     /// Recovers the Ethereum address which was used to sign the transaction.
     pub fn recover(&self) -> Result<Address, RecoveryError> {
         Ok(match self {
@@ -216,6 +231,8 @@ impl FoundryTxEnvelope {
             #[cfg(feature = "base")]
             Self::Eip8130(tx) => tx.recover_sender()?,
             Self::Tempo(tx) => tx.signature().recover_signer(&tx.signature_hash())?,
+            #[cfg(feature = "monad")]
+            Self::Encrypted(tx) => tx.recover_signer()?,
         })
     }
 
@@ -315,6 +332,10 @@ impl FoundryTypedTx {
                 let tempo_sig: TempoSignature = signature.into();
                 FoundryTxEnvelope::Tempo(tx.into_signed(tempo_sig))
             }
+            #[cfg(feature = "monad")]
+            Self::Encrypted(_) => {
+                unreachable!("encrypted transactions require a signed raw transaction envelope")
+            }
         }
     }
 
@@ -357,6 +378,8 @@ impl TxHashRef for FoundryTxEnvelope {
             #[cfg(feature = "base")]
             Self::Eip8130(t) => t.hash(),
             Self::Tempo(t) => t.hash(),
+            #[cfg(feature = "monad")]
+            Self::Encrypted(t) => t.hash(),
         }
     }
 }
@@ -437,6 +460,19 @@ impl TryFrom<AnyRpcTransaction> for FoundryTxEnvelope {
                         ConversionError::Custom(format!("Failed to deserialize tempo tx: {e}"))
                     })?;
                     return Ok(Self::Tempo(tempo_tx));
+                }
+
+                // Mined views show the restored fields, and deserialization resets them to the
+                // placeholders; the hash follows from the resulting wire form.
+                #[cfg(feature = "monad")]
+                if tx.ty() == ENCRYPTED_TX_TYPE_ID {
+                    let error = |e: serde_json::Error| {
+                        ConversionError::Custom(format!("Failed to deserialize encrypted tx: {e}"))
+                    };
+                    let fields = &tx.inner.fields;
+                    let signature = fields.deserialize_as::<Signature>().map_err(error)?;
+                    let tx = fields.deserialize_as::<TxEncrypted>().map_err(error)?;
+                    return Ok(Self::Encrypted(tx.into_signed(signature)));
                 }
 
                 #[cfg(all(feature = "base", not(feature = "optimism")))]
@@ -560,6 +596,11 @@ impl FromRecoveredTx<FoundryTxEnvelope> for TxEnv {
                 unreachable!("EIP-8130 transaction in Ethereum context")
             }
             FoundryTxEnvelope::Tempo(_) => unreachable!("Tempo tx in Ethereum context"),
+            // The wire form: only the Monad block executor can decrypt the encrypted fields.
+            #[cfg(feature = "monad")]
+            FoundryTxEnvelope::Encrypted(signed_tx) => {
+                Self::from_recovered_tx(&signed_tx.tx().to_eip1559(), caller)
+            }
         }
     }
 }
@@ -597,6 +638,8 @@ impl FromRecoveredTx<FoundryTxEnvelope> for TempoTxEnv {
                 unreachable!("EIP-8130 transaction in Tempo context")
             }
             FoundryTxEnvelope::Tempo(aa_signed) => Self::from_recovered_tx(aa_signed, caller),
+            #[cfg(feature = "monad")]
+            FoundryTxEnvelope::Encrypted(_) => unreachable!("encrypted tx in Tempo context"),
         }
     }
 }
@@ -622,6 +665,8 @@ impl std::fmt::Display for FoundryTxType {
             #[cfg(feature = "base")]
             Self::Eip8130 => write!(f, "eip8130"),
             Self::Tempo => write!(f, "tempo"),
+            #[cfg(feature = "monad")]
+            Self::Encrypted => write!(f, "encrypted"),
         }
     }
 }
@@ -653,6 +698,8 @@ impl From<FoundryTxEnvelope> for FoundryTypedTx {
             #[cfg(feature = "base")]
             FoundryTxEnvelope::Eip8130(signed_tx) => Self::Eip8130(signed_tx.into_tx()),
             FoundryTxEnvelope::Tempo(signed_tx) => Self::Tempo(signed_tx.strip_signature()),
+            #[cfg(feature = "monad")]
+            FoundryTxEnvelope::Encrypted(signed_tx) => Self::Encrypted(signed_tx.strip_signature()),
         }
     }
 }

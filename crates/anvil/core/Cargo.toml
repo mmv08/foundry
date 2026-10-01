@@ -44,6 +44,7 @@ thiserror.workspace = true
 [features]
 default = ["optimism"]
 base = []
+monad = []
 optimism = [
     "foundry-primitives/optimism",
     "foundry-common/optimism",

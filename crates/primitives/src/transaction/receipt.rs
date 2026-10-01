@@ -28,6 +28,9 @@ use op_alloy_consensus::{
     DEPOSIT_TX_TYPE_ID, OpDepositReceipt, OpDepositReceiptWithBloom, POST_EXEC_TX_TYPE_ID,
 };
 
+#[cfg(feature = "monad")]
+use super::ENCRYPTED_TX_TYPE_ID;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum FoundryReceiptEnvelope<T = Log> {
@@ -52,6 +55,9 @@ pub enum FoundryReceiptEnvelope<T = Log> {
     Eip8130(ReceiptWithBloom<Eip8130Receipt<T>>),
     #[serde(rename = "0x76")]
     Tempo(ReceiptWithBloom<Receipt<T>>),
+    #[cfg(feature = "monad")]
+    #[serde(rename = "0x8", alias = "0x08")]
+    Encrypted(ReceiptWithBloom<Receipt<T>>),
     /// A receipt with a transaction type Foundry does not model.
     ///
     /// Anvil cannot execute these transactions, but it must still relay receipts fetched from a
@@ -117,6 +123,10 @@ impl FoundryReceiptEnvelope<alloy_rpc_types::Log> {
             }),
             FoundryTxType::Tempo => {
                 Self::Tempo(ReceiptWithBloom { receipt: inner_receipt, logs_bloom })
+            }
+            #[cfg(feature = "monad")]
+            FoundryTxType::Encrypted => {
+                Self::Encrypted(ReceiptWithBloom { receipt: inner_receipt, logs_bloom })
             }
         }
     }
@@ -202,6 +212,8 @@ impl<T> FoundryReceiptEnvelope<T> {
             #[cfg(feature = "base")]
             Self::Eip8130(_) => EIP8130_TRANSACTION_TYPE,
             Self::Tempo(_) => TEMPO_TX_TYPE_ID,
+            #[cfg(feature = "monad")]
+            Self::Encrypted(_) => ENCRYPTED_TX_TYPE_ID,
             Self::Unknown(r) => r.r#type,
         }
     }
@@ -221,6 +233,8 @@ impl<T> FoundryReceiptEnvelope<T> {
             #[cfg(feature = "base")]
             Self::Eip8130(_) => FoundryTxType::Eip8130,
             Self::Tempo(_) => FoundryTxType::Tempo,
+            #[cfg(feature = "monad")]
+            Self::Encrypted(_) => FoundryTxType::Encrypted,
             Self::Unknown(_) => return None,
         })
     }
@@ -256,6 +270,8 @@ impl<T> FoundryReceiptEnvelope<T> {
                 FoundryReceiptEnvelope::Eip8130(r.map_receipt(|r: Eip8130Receipt<T>| r.map_logs(f)))
             }
             Self::Tempo(r) => FoundryReceiptEnvelope::Tempo(r.map_logs(f)),
+            #[cfg(feature = "monad")]
+            Self::Encrypted(r) => FoundryReceiptEnvelope::Encrypted(r.map_logs(f)),
             Self::Unknown(r) => FoundryReceiptEnvelope::Unknown(AnyReceiptEnvelope {
                 inner: r.inner.map_logs(f),
                 r#type: r.r#type,
@@ -288,6 +304,8 @@ impl<T> FoundryReceiptEnvelope<T> {
             #[cfg(feature = "base")]
             Self::Eip8130(t) => &t.logs_bloom,
             Self::Tempo(t) => &t.logs_bloom,
+            #[cfg(feature = "monad")]
+            Self::Encrypted(t) => &t.logs_bloom,
             Self::Unknown(t) => &t.inner.logs_bloom,
         }
     }
@@ -303,6 +321,8 @@ impl<T> FoundryReceiptEnvelope<T> {
             | Self::Tempo(t) => t.receipt,
             #[cfg(feature = "optimism")]
             Self::PostExec(t) => t.receipt,
+            #[cfg(feature = "monad")]
+            Self::Encrypted(t) => t.receipt,
             #[cfg(any(feature = "base", feature = "optimism"))]
             Self::Deposit(t) => t.receipt.into_inner(),
             #[cfg(feature = "base")]
@@ -322,6 +342,8 @@ impl<T> FoundryReceiptEnvelope<T> {
             | Self::Tempo(t) => &t.receipt,
             #[cfg(feature = "optimism")]
             Self::PostExec(t) => &t.receipt,
+            #[cfg(feature = "monad")]
+            Self::Encrypted(t) => &t.receipt,
             #[cfg(any(feature = "base", feature = "optimism"))]
             Self::Deposit(t) => &t.receipt.inner,
             #[cfg(feature = "base")]
@@ -402,6 +424,8 @@ impl Encodable2718 for FoundryReceiptEnvelope {
             #[cfg(feature = "base")]
             Self::Eip8130(r) => 1 + r.length(),
             Self::Tempo(r) => 1 + r.length(),
+            #[cfg(feature = "monad")]
+            Self::Encrypted(r) => 1 + r.length(),
             Self::Unknown(r) => r.rlp_payload_length(),
         }
     }
@@ -423,6 +447,8 @@ impl Encodable2718 for FoundryReceiptEnvelope {
             Self::Deposit(r) => r.encode(out),
             #[cfg(feature = "base")]
             Self::Eip8130(r) => r.encode(out),
+            #[cfg(feature = "monad")]
+            Self::Encrypted(r) => r.encode(out),
             Self::Unknown(r) => r.inner.encode(out),
         }
     }
@@ -449,6 +475,10 @@ impl Decodable2718 for FoundryReceiptEnvelope {
         }
         if ty == TEMPO_TX_TYPE_ID {
             return Ok(Self::Tempo(ReceiptWithBloom::decode(buf)?));
+        }
+        #[cfg(feature = "monad")]
+        if ty == ENCRYPTED_TX_TYPE_ID {
+            return Ok(Self::Encrypted(ReceiptWithBloom::decode(buf)?));
         }
         match ty {
             LEGACY_TX_TYPE_ID => Err(Eip2718Error::UnexpectedType(LEGACY_TX_TYPE_ID)),
@@ -536,6 +566,8 @@ mod tests {
             FoundryTxType::Eip8130,
             #[cfg(any(feature = "base", feature = "optimism"))]
             FoundryTxType::Deposit,
+            #[cfg(feature = "monad")]
+            FoundryTxType::Encrypted,
         ] {
             assert_roundtrip(receipt_for(tx_type));
         }

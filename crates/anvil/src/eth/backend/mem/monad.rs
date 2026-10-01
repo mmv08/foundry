@@ -6,6 +6,7 @@ use super::{
 };
 use crate::eth::{
     backend::{
+        btx::{self, TestKey},
         db::MonadBlockReplayProfile,
         executor::{
             AnvilBlockExecutor, AnvilTxResult, ExecutedPoolTransactions, PoolTxGasConfig,
@@ -20,22 +21,26 @@ use crate::eth::{
     pool::transactions::PoolTransaction,
 };
 use alloy_consensus::{
-    BlockHeader, Header, Transaction as _, constants::EMPTY_ROOT_HASH, transaction::Recovered,
+    BlockHeader, Header, Transaction as _, TxEip1559, constants::EMPTY_ROOT_HASH,
+    transaction::Recovered,
 };
 use alloy_eips::eip1559::BaseFeeParams;
 use alloy_evm::{
-    Database, Evm, EvmEnv, EvmFactory, RecoveredTx,
+    Database, Evm, EvmEnv, EvmFactory, FromRecoveredTx, RecoveredTx,
     block::{
         BalIndexedDatabase, BlockExecutionError, BlockExecutionResult, BlockExecutor, StateDB,
     },
 };
 use alloy_monad_evm::{MonadContext, MonadEvm, MonadEvmFactory};
-use alloy_network::{BlockResponse, Network};
-use alloy_primitives::{B256, U256};
+use alloy_network::{AnyRpcTransaction, AnyTxEnvelope, BlockResponse, Network};
+use alloy_primitives::{Address, B256, Bytes, U256};
 use alloy_rpc_types::{AccessList, BlockNumberOrTag as BlockNumber, BlockTransactions};
-use anvil_core::eth::{
-    block::Block,
-    transaction::{MaybeImpersonatedTransaction, PendingTransaction},
+use anvil_core::{
+    eth::{
+        block::Block,
+        transaction::{MaybeImpersonatedTransaction, PendingTransaction},
+    },
+    types::EncryptionContext,
 };
 use eyre::{Context, Result};
 use foundry_evm::{
@@ -51,14 +56,20 @@ use foundry_evm::{
     hardfork::FoundryHardfork,
     utils::get_blob_params,
 };
-use foundry_primitives::{FoundryReceiptEnvelope, FoundryTxEnvelope};
+use foundry_primitives::{
+    DecryptionFailure, DecryptionStatus, FoundryReceiptEnvelope, FoundryTxEnvelope, TxEncrypted,
+};
 use monad_revm::{MonadChainContext, MonadHardfork, instructions::monad_gas_params};
 use revm::{
     Inspector,
     context::{Transaction, TxEnv},
     context_interface::{
+        ContextTr, JournalTr,
         block::BlobExcessGasAndPrice,
-        result::{HaltReason, InvalidTransaction, ResultAndState},
+        journaled_state::account::JournaledAccountTr,
+        result::{
+            EVMError, ExecutionResult, HaltReason, InvalidTransaction, ResultAndState, ResultGas,
+        },
         transaction::AuthorizationTr,
     },
     database_interface::WrapDatabaseRef,
@@ -66,7 +77,10 @@ use revm::{
     state::AccountInfo,
 };
 use std::sync::Arc;
-use tracing::debug;
+use tracing::{debug, warn};
+
+/// The one encryption epoch this node serves.
+const ENCRYPTION_EPOCH: u64 = 1;
 
 /// Resolved Monad inputs, including a transaction context for standalone calls.
 pub(super) struct PreparedExecution {
@@ -158,10 +172,18 @@ fn execute_pool_transaction<DB>(
     tx_env: TxEnv,
     recovered: Recovered<FoundryTxEnvelope>,
     is_replay: bool,
+    encryption_key: Option<&TestKey>,
 ) -> Result<AnvilTxResult<HaltReason>, BlockExecutionError>
 where
     DB: StateDB<Error = DatabaseError> + BalIndexedDatabase,
 {
+    if let FoundryTxEnvelope::Encrypted(tx) = recovered.tx() {
+        // Admission requires the key; this guards paths that bypass it, such as `anvil_reorg`.
+        let key = encryption_key
+            .ok_or_else(|| BlockExecutionError::msg("encrypted transactions are not enabled"))?;
+        let restored = decrypt(key, tx.tx(), recovered.signer());
+        return execute_encrypted_transaction(executor, tx_env, recovered, restored);
+    }
     prepare_transaction(executor.evm_mut(), &tx_env);
     let result = (|| {
         if !is_replay {
@@ -193,6 +215,118 @@ where
         rollback_transaction(executor.evm_mut());
     }
     result
+}
+
+/// Executes a decrypted pool candidate on its restored fields.
+///
+/// A candidate without a usable payload, or one that fails a check only the restored fields can
+/// answer (intrinsic gas, the calldata floor or the initcode limit), executes nothing. It still
+/// uses its nonce and pays for its full gas limit, as every Monad transaction does, so the
+/// sender's later transactions stay valid. This charge is a development default.
+fn execute_encrypted_transaction<DB>(
+    executor: &mut AnvilBlockExecutor<MonadEvm<DB, AnvilInspector>>,
+    public_tx_env: TxEnv,
+    recovered: Recovered<FoundryTxEnvelope>,
+    restored: Result<TxEip1559, DecryptionFailure>,
+) -> Result<AnvilTxResult<HaltReason>, BlockExecutionError>
+where
+    DB: StateDB<Error = DatabaseError> + BalIndexedDatabase,
+{
+    // revm checks fees only for the transaction types it knows, so the restored fields execute
+    // as the EIP-1559 transaction the sender built in the clear.
+    let tx_env = match &restored {
+        Ok(tx) => TxEnv::from_recovered_tx(tx, recovered.signer()),
+        Err(_) => public_tx_env,
+    };
+    prepare_transaction(executor.evm_mut(), &tx_env);
+    let result = executor.execute_transaction_without_commit_with(
+        (tx_env, recovered),
+        |evm, tx_env, transaction_hash| {
+            let (caller, gas_limit) = (tx_env.caller, tx_env.gas_limit);
+            let gas_price = tx_env.effective_gas_price(evm.block().basefee.into());
+            if let Err(failure) = restored {
+                warn!(target: "backend", ?failure, "[{transaction_hash:?}] encrypted transaction executes nothing");
+                return charge_without_executing(evm, caller, gas_limit, gas_price);
+            }
+            match evm.transact(tx_env) {
+                Err(EVMError::Transaction(
+                    err @ (InvalidTransaction::CallGasCostMoreThanGasLimit { .. }
+                    | InvalidTransaction::GasFloorMoreThanGasLimit { .. }
+                    | InvalidTransaction::CreateInitCodeSizeLimit),
+                )) => {
+                    warn!(target: "backend", %err, "[{transaction_hash:?}] encrypted transaction executes nothing");
+                    charge_without_executing(evm, caller, gas_limit, gas_price)
+                }
+                result => result.map_err(|err| BlockExecutionError::evm(err, transaction_hash)),
+            }
+        },
+    );
+    if result.is_err() {
+        rollback_transaction(executor.evm_mut());
+    }
+    result
+}
+
+/// Charges a transaction that executes nothing: the sender uses its nonce and pays for the full
+/// gas limit, and the beneficiary earns the priority fee, as the Monad handler charges.
+fn charge_without_executing<DB: Database>(
+    evm: &mut MonadEvm<DB, AnvilInspector>,
+    caller: Address,
+    gas_limit: u64,
+    gas_price: u128,
+) -> Result<ResultAndState<HaltReason>, BlockExecutionError> {
+    let beneficiary = evm.block().beneficiary;
+    let tip = gas_price.saturating_sub(evm.block().basefee.into());
+    let journal = evm.ctx_mut().journal_mut();
+    {
+        let mut account = journal.load_account_mut(caller).map_err(BlockExecutionError::other)?;
+        let balance =
+            account.balance().saturating_sub(U256::from(gas_limit) * U256::from(gas_price));
+        account.set_balance(balance);
+        account.bump_nonce();
+    }
+    journal
+        .balance_incr(beneficiary, U256::from(gas_limit) * U256::from(tip))
+        .map_err(BlockExecutionError::other)?;
+    journal.commit_tx();
+    let result = ExecutionResult::Revert {
+        gas: ResultGas::default().with_total_gas_spent(gas_limit),
+        logs: Vec::new(),
+        output: Bytes::new(),
+    };
+    Ok(ResultAndState::new(result, journal.finalize()))
+}
+
+/// Decrypts an encrypted transaction and restores its encrypted fields, all or nothing.
+fn decrypt(
+    key: &TestKey,
+    tx: &TxEncrypted,
+    sender: Address,
+) -> Result<TxEip1559, DecryptionFailure> {
+    let plaintext = key
+        .decrypt(&tx.ciphertext, tx.associated_data(sender).as_slice())
+        .ok_or(DecryptionFailure::DecryptionFailed)?;
+    tx.decode_payload(&plaintext).map_err(|_| DecryptionFailure::InvalidPayload)
+}
+
+/// Shows a mined encrypted transaction's restored fields and decryption status in its view.
+pub(super) fn show_decryption(
+    view: &mut AnyRpcTransaction,
+    decryption: &Result<TxEip1559, DecryptionFailure>,
+) {
+    let AnyTxEnvelope::Unknown(envelope) = view.0.inner.inner.inner_mut() else { return };
+    let fields = &mut envelope.inner.fields;
+    let status = match decryption {
+        Ok(tx) => {
+            fields.insert("to".to_string(), serde_json::to_value(tx.to).unwrap());
+            fields.insert("value".to_string(), serde_json::to_value(tx.value).unwrap());
+            fields.insert("input".to_string(), serde_json::to_value(&tx.input).unwrap());
+            fields.insert("accessList".to_string(), serde_json::to_value(&tx.access_list).unwrap());
+            DecryptionStatus::Succeeded
+        }
+        Err(_) => DecryptionStatus::Failed,
+    };
+    fields.insert("decryptionStatus".to_string(), serde_json::to_value(status).unwrap());
 }
 
 /// Adds a candidate transaction to the current Monad block context.
@@ -558,6 +692,7 @@ impl<N: Network> Backend<N> {
         executor
             .apply_pre_execution_changes()
             .map_err(|err| BlockchainError::Internal(err.to_string()))?;
+        let encryption_key = self.encryption_key.as_deref();
         let pool_result = execute_pool_transactions(
             &mut executor,
             pool_transactions,
@@ -565,7 +700,9 @@ impl<N: Network> Backend<N> {
             inspector_tx_config,
             self.cheats(),
             validator,
-            &mut execute_pool_transaction,
+            &mut |executor, tx_env, recovered, is_replay| {
+                execute_pool_transaction(executor, tx_env, recovered, is_replay, encryption_key)
+            },
         );
         let (evm, block_result) =
             executor.finish().map_err(|err| BlockchainError::Internal(err.to_string()))?;
@@ -886,6 +1023,55 @@ impl<N: Network> Backend<N> {
             evm_env.cfg_env.clone().with_spec_and_gas_params(hardfork, monad_gas_params(hardfork)),
             evm_env.block_env.clone(),
         )
+    }
+
+    /// Rejects encrypted transactions unless the node holds a test key.
+    pub(crate) const fn ensure_encrypted_transactions_active(&self) -> Result<(), BlockchainError> {
+        if self.encryption_key.is_some() {
+            Ok(())
+        } else {
+            Err(BlockchainError::EncryptedTransactionUnsupported)
+        }
+    }
+
+    /// Runs the static checks that encrypted transactions add, cheapest first: the encrypted
+    /// fields and their placeholders, the epoch, then the ciphertext's binding to the transaction
+    /// and its recovered sender.
+    pub(super) fn validate_encrypted_transaction(
+        &self,
+        pending: &PendingTransaction<FoundryTxEnvelope>,
+    ) -> Result<(), InvalidTransactionError> {
+        let FoundryTxEnvelope::Encrypted(tx) = pending.transaction.as_ref() else { return Ok(()) };
+        let tx = tx.tx();
+        tx.validate_encrypted_fields().map_err(InvalidTransactionError::EncryptedFields)?;
+        if tx.epoch != ENCRYPTION_EPOCH {
+            return Err(InvalidTransactionError::EncryptionEpoch {
+                epoch: tx.epoch,
+                active: ENCRYPTION_EPOCH,
+            });
+        }
+        btx::admit(&tx.ciphertext, tx.associated_data(*pending.sender()).as_slice())
+            .map_err(InvalidTransactionError::Ciphertext)
+    }
+
+    /// Derives a mined encrypted transaction's outcome again, as mining did: its restored fields,
+    /// or why it executed nothing. Returns `None` for other transactions and without a key.
+    pub(super) fn decrypt_mined(
+        &self,
+        tx: &FoundryTxEnvelope,
+        sender: Address,
+    ) -> Option<Result<TxEip1559, DecryptionFailure>> {
+        let FoundryTxEnvelope::Encrypted(tx) = tx else { return None };
+        Some(decrypt(self.encryption_key.as_deref()?, tx.tx(), sender))
+    }
+
+    /// Returns the key and epoch for encrypted transactions, or `None` when they are disabled.
+    pub(crate) fn encryption_context(&self) -> Option<EncryptionContext> {
+        self.encryption_key.as_ref().map(|key| EncryptionContext {
+            epoch: ENCRYPTION_EPOCH,
+            encryption_key: Bytes::copy_from_slice(key.encryption_key()),
+            available: true,
+        })
     }
 
     /// Monad path of [`Backend::transact_call_with_inspector_ref`].

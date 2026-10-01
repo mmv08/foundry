@@ -20,6 +20,9 @@ use serde::Serialize;
 use tempo_revm::TempoInvalidTransaction;
 use tokio::time::Duration;
 
+#[cfg(feature = "monad")]
+use crate::eth::backend::btx::BtxError;
+
 #[cfg(feature = "base")]
 mod base;
 #[cfg(feature = "optimism")]
@@ -142,6 +145,14 @@ pub enum BlockchainError {
     #[cfg(feature = "base")]
     #[error("Base transactions require native Base execution; run Anvil with --network base")]
     BaseTransactionUnsupported,
+    #[cfg(feature = "monad")]
+    #[error(
+        "encrypted transaction received but is not supported.\n\nYou can use it by running anvil with '--network monad --monad.encrypted-transactions'."
+    )]
+    EncryptedTransactionUnsupported,
+    #[cfg(feature = "monad")]
+    #[error("encrypted transactions cannot be replayed or simulated")]
+    EncryptedTransactionReplayUnsupported,
     #[error("Unknown transaction type not supported")]
     UnknownTransactionType,
     #[error("Excess blob gas not set.")]
@@ -352,6 +363,18 @@ pub enum InvalidTransactionError {
     /// Thrown when a blob transaction is submitted on a Monad network.
     #[error("EIP-4844 blob transactions are not supported on Monad")]
     MonadBlobTransactionUnsupported,
+    /// Thrown when an encrypted transaction's `encrypted_fields` or placeholders are invalid.
+    #[cfg(feature = "monad")]
+    #[error("invalid encrypted transaction: {0}")]
+    EncryptedFields(&'static str),
+    /// Thrown when an encrypted transaction names an epoch other than the active one.
+    #[cfg(feature = "monad")]
+    #[error("encryption epoch {epoch} is not the active epoch {active}")]
+    EncryptionEpoch { epoch: u64, active: u64 },
+    /// Thrown when an encrypted transaction's ciphertext fails admission.
+    #[cfg(feature = "monad")]
+    #[error("invalid ciphertext: {0}")]
+    Ciphertext(BtxError),
     /// Thrown when there are no `blob_hashes` in the transaction.
     #[error("There should be at least one blob in a Blob transaction.")]
     EmptyBlobs,
@@ -640,6 +663,11 @@ impl<T: Serialize> ToRpcResponseResult for Result<T> {
                 }
                 #[cfg(feature = "base")]
                 err @ BlockchainError::BaseTransactionUnsupported => {
+                    RpcError::invalid_params(err.to_string())
+                }
+                #[cfg(feature = "monad")]
+                err @ (BlockchainError::EncryptedTransactionUnsupported
+                | BlockchainError::EncryptedTransactionReplayUnsupported) => {
                     RpcError::invalid_params(err.to_string())
                 }
                 err @ BlockchainError::TempoTransactionUnsupported => {

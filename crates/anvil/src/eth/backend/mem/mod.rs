@@ -250,6 +250,11 @@ use foundry_evm::{
 #[cfg(feature = "base")]
 use revm::inspector::NoOpInspector;
 
+#[cfg(feature = "monad")]
+use crate::eth::backend::btx::TestKey;
+#[cfg(feature = "monad")]
+use foundry_primitives::{DecryptionStatus, ENCRYPTED_TX_TYPE_ID};
+
 #[cfg(feature = "optimism")]
 use alloy_op_evm::{OpEvmContext, OpEvmFactory, OpTx};
 #[cfg(feature = "optimism")]
@@ -1063,6 +1068,9 @@ pub struct Backend<N: Network> {
     /// Base activation-registry administrator override.
     #[cfg(feature = "base")]
     base_activation_admin: Option<Address>,
+    /// The test key that decrypts Monad encrypted transactions, when they are enabled.
+    #[cfg(feature = "monad")]
+    encryption_key: Option<Arc<TestKey>>,
     /// The active hardfork.
     hardfork: Arc<RwLock<FoundryHardfork>>,
     /// This is set if this is currently forked off another client.
@@ -1120,6 +1128,8 @@ impl<N: Network> Clone for Backend<N> {
             networks: self.networks,
             #[cfg(feature = "base")]
             base_activation_admin: self.base_activation_admin,
+            #[cfg(feature = "monad")]
+            encryption_key: self.encryption_key.clone(),
             hardfork: self.hardfork.clone(),
             fork: self.fork.clone(),
             last_fork_cache_source: self.last_fork_cache_source.clone(),
@@ -2247,16 +2257,39 @@ impl<N: Network> Backend<N> {
         block: &Block,
     ) -> Option<Vec<AnyRpcTransaction>> {
         let mut transactions = Vec::with_capacity(block.body.transactions.len());
-        let base_fee = block.header.base_fee_per_gas();
         let storage = self.blockchain.storage.read();
         for hash in block.body.transactions.iter().map(|tx| tx.hash()) {
             let info = storage.transactions.get(&hash)?.info.clone();
             let tx = block.body.transactions.get(info.transaction_index as usize)?.clone();
 
-            let tx = transaction_build(Some(hash), tx, Some(block), Some(info), base_fee);
+            let tx = self.mined_transaction_build(tx, block, info);
             transactions.push(tx);
         }
         Some(transactions)
+    }
+
+    /// Builds the RPC view of a mined transaction.
+    fn mined_transaction_build(
+        &self,
+        tx: MaybeImpersonatedTransaction<FoundryTxEnvelope>,
+        block: &Block,
+        info: TransactionInfo,
+    ) -> AnyRpcTransaction {
+        #[cfg(feature = "monad")]
+        let decryption = self.decrypt_mined(tx.as_ref(), info.from);
+        #[cfg_attr(not(feature = "monad"), allow(unused_mut))]
+        let mut view = transaction_build(
+            Some(info.transaction_hash),
+            tx,
+            Some(block),
+            Some(info),
+            block.header.base_fee_per_gas(),
+        );
+        #[cfg(feature = "monad")]
+        if let Some(decryption) = decryption {
+            monad::show_decryption(&mut view, &decryption);
+        }
+        view
     }
 
     pub fn mined_block_by_number(&self, number: BlockNumber) -> Option<AnyRpcBlock> {
@@ -2790,6 +2823,11 @@ impl<N: Network> Backend<N> {
     {
         let tx = pending.transaction.as_ref();
         let sender = *pending.sender();
+        // A replay or simulation would need the plaintext, which only mining decrypts.
+        #[cfg(feature = "monad")]
+        if tx.is_encrypted() {
+            return Err(BlockchainError::EncryptedTransactionReplayUnsupported);
+        }
         #[cfg(feature = "base")]
         if self.is_base() {
             let base_tx: BaseTransaction<TxEnv> =
@@ -3805,13 +3843,7 @@ impl<N: Network> Backend<N> {
             (info, block, tx)
         };
 
-        Some(transaction_build(
-            Some(info.transaction_hash),
-            tx,
-            Some(&block),
-            Some(info),
-            block.header.base_fee_per_gas(),
-        ))
+        Some(self.mined_transaction_build(tx, &block, info))
     }
 
     pub async fn transaction_by_hash(
@@ -3843,13 +3875,7 @@ impl<N: Network> Backend<N> {
         };
         let tx = block.body.transactions.get(info.transaction_index as usize)?.clone();
 
-        Some(transaction_build(
-            Some(info.transaction_hash),
-            tx,
-            Some(&block),
-            Some(info),
-            block.header.base_fee_per_gas(),
-        ))
+        Some(self.mined_transaction_build(tx, &block, info))
     }
 
     /// Returns the traces for the given transaction
@@ -4436,6 +4462,14 @@ impl<N: Network> Backend<N> {
             StagedForkDbUser { db: Some(Arc::clone(&db)), cache_lease: startup_cache_lease };
         #[cfg(feature = "base")]
         let base_activation_admin = node_config.read().await.base_activation_admin;
+        #[cfg(feature = "monad")]
+        let encryption_key = node_config
+            .read()
+            .await
+            .monad_encryption_trapdoor
+            .map(TestKey::new)
+            .transpose()?
+            .map(Arc::new);
 
         let backend = Self {
             db,
@@ -4445,6 +4479,8 @@ impl<N: Network> Backend<N> {
             networks,
             #[cfg(feature = "base")]
             base_activation_admin,
+            #[cfg(feature = "monad")]
+            encryption_key,
             hardfork: Arc::new(RwLock::new(hardfork)),
             fork,
             last_fork_cache_source: Arc::new(RwLock::new(last_fork_cache_source)),
@@ -4780,6 +4816,14 @@ impl<N: Network> Backend<N> {
         forking: Forking,
         serving_instance_id: B256,
     ) -> Result<StagedForkReset, BlockchainError> {
+        // The test key decrypts a fresh local Monad chain only.
+        #[cfg(feature = "monad")]
+        if self.encryption_key.is_some() {
+            return Err(RpcError::invalid_params(
+                "encrypted transactions cannot be used with forking",
+            )
+            .into());
+        }
         let previous_fork = self.get_fork();
         let previous_source = self
             .last_fork_cache_source
@@ -6276,6 +6320,12 @@ where
     where
         F: FnOnce(Box<dyn MaybeFullDatabase + '_>, BlockInfo<N>) -> T,
     {
+        // Pending views and simulations never see plaintext: only mining decrypts.
+        #[cfg(feature = "monad")]
+        let pool_transactions: Vec<_> = pool_transactions
+            .into_iter()
+            .filter(|tx| !tx.pending_transaction.transaction.is_encrypted())
+            .collect();
         let db = self.db.read().await;
         let evm_env = self.next_evm_env();
 
@@ -7849,6 +7899,8 @@ where
             .map(|_| alloy_eips::eip4844::calc_blob_gasprice(excess_blob_gas.unwrap_or_default()));
 
         let effective_gas_price = transaction.effective_gas_price(block.header.base_fee_per_gas());
+        #[cfg(feature = "monad")]
+        let decryption = self.decrypt_mined(&transaction, info.from);
 
         #[cfg(feature = "base")]
         let eip8130_phase_statuses = tx_receipt.eip8130_phase_statuses().to_vec();
@@ -7860,7 +7912,8 @@ where
             next_log_index,
         );
 
-        let receipt = TransactionReceipt {
+        #[cfg_attr(not(feature = "monad"), allow(unused_mut))]
+        let mut receipt = TransactionReceipt {
             inner: tx_receipt,
             transaction_hash: info.transaction_hash,
             transaction_index: Some(info.transaction_index),
@@ -7874,9 +7927,20 @@ where
             blob_gas_price,
             blob_gas_used,
         };
+        // Mining recorded the placeholders; show the restored recipient and any created contract.
+        #[cfg(feature = "monad")]
+        if let Some(Ok(restored)) = &decryption {
+            receipt.to = restored.to.to().copied();
+            receipt.contract_address =
+                restored.to.is_create().then(|| info.from.create(info.nonce));
+        }
 
         // Include timestamp in receipt to avoid extra block lookups (e.g., in Otterscan API)
         let mut inner = FoundryTxReceipt::with_timestamp(receipt, block.header.timestamp());
+        #[cfg(feature = "monad")]
+        if let Some(decryption) = decryption {
+            inner = inner.with_decryption(decryption.err());
+        }
         if self.is_tempo() {
             let fee_payer = match &*transaction {
                 FoundryTxEnvelope::Tempo(tx) => match tx.tx().recover_fee_payer(info.from) {
@@ -9631,6 +9695,9 @@ where
 
         self.validate_pool_transaction_for(tx, &account, &evm_env)?;
 
+        #[cfg(feature = "monad")]
+        self.validate_encrypted_transaction(tx)?;
+
         // Tempo charges gas in a fee token for every transaction type, never in the native token,
         // so the node's own pool validation replaces the native balance check skipped above.
         if self.is_tempo() && !self.disable_pool_balance_checks {
@@ -10021,6 +10088,39 @@ pub fn transaction_build(
                 error!(target: "backend", "failed to serialize tempo transaction");
             }
         }
+    }
+
+    // Shows the fields as signed, so an encrypted field shows its placeholder. The backend adds
+    // the restored fields to mined views.
+    #[cfg(feature = "monad")]
+    if let FoundryTxEnvelope::Encrypted(encrypted_tx) = eth_transaction.as_ref() {
+        let from = mined_from.unwrap_or_else(|| eth_transaction.recover().unwrap_or_default());
+        let mut fields = OtherFields::try_from(
+            serde_json::to_value(encrypted_tx).expect("could not serialize encrypted transaction"),
+        )
+        .expect("encrypted transaction must serialize to an object");
+        if block.is_none() {
+            fields.insert(
+                "decryptionStatus".to_string(),
+                serde_json::to_value(DecryptionStatus::Pending).unwrap(),
+            );
+        }
+        let envelope = AnyTxEnvelope::Unknown(UnknownTxEnvelope {
+            hash: tx_hash.unwrap_or_else(|| eth_transaction.hash()),
+            inner: UnknownTypedTransaction {
+                ty: AnyTxType(ENCRYPTED_TX_TYPE_ID),
+                fields,
+                memo: Default::default(),
+            },
+        });
+        let effective_gas_price = eth_transaction.effective_gas_price(base_fee);
+        return build_rpc_transaction(
+            envelope,
+            from,
+            block,
+            info.as_ref(),
+            Some(effective_gas_price),
+        );
     }
 
     let from = mined_from.unwrap_or_else(|| eth_transaction.recover().unwrap_or_default());

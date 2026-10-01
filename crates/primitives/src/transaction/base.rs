@@ -84,6 +84,10 @@ impl FromTxWithEncoded<FoundryTxEnvelope> for BaseTransaction<TxEnv> {
                 Self::from_encoded_tx(&envelope, caller, encoded)
             }
             FoundryTxEnvelope::Tempo(_) => unreachable!("Tempo transaction in Base context"),
+            #[cfg(feature = "monad")]
+            FoundryTxEnvelope::Encrypted(_) => {
+                unreachable!("encrypted transaction in Base context")
+            }
         }
     }
 }

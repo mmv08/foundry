@@ -203,6 +203,10 @@ impl FoundryTransactionRequest {
                 Err(vec!["EIP-8130 requires a signed raw transaction envelope"])
             }
             FoundryTxType::Tempo => self.complete_tempo(),
+            #[cfg(feature = "monad")]
+            FoundryTxType::Encrypted => {
+                Err(vec!["encrypted transactions require a signed raw transaction envelope"])
+            }
         }
     }
 
@@ -483,6 +487,9 @@ impl From<FoundryTypedTx> for FoundryTransactionRequest {
                 Self::Base(super::base::simulation_request(tx, None, None, None))
             }
             FoundryTypedTx::Tempo(tx) => Self::Tempo(Box::new(tx.into())),
+            // The fields as they appear on the wire, with the encrypted ones at their placeholders.
+            #[cfg(feature = "monad")]
+            FoundryTypedTx::Encrypted(tx) => Self::Ethereum(tx.to_eip1559().into()),
         }
     }
 }

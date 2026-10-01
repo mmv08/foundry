@@ -351,6 +351,9 @@ pub struct NodeConfig {
     /// Overrides the Base activation-registry administrator.
     #[cfg(feature = "base")]
     pub base_activation_admin: Option<Address>,
+    /// The trapdoor of the insecure test key that enables Monad encrypted transactions.
+    #[cfg(feature = "monad")]
+    pub monad_encryption_trapdoor: Option<U256>,
     /// The account used to sponsor Tempo fee-payer requests.
     ///
     /// Must be an unlocked signer account. Defaults to the last dev account on Tempo networks.
@@ -709,6 +712,8 @@ impl Default for NodeConfig {
             networks: Default::default(),
             #[cfg(feature = "base")]
             base_activation_admin: None,
+            #[cfg(feature = "monad")]
+            monad_encryption_trapdoor: None,
             tempo_fee_payer: None,
             silent: false,
             cache_path: None,
@@ -1384,6 +1389,14 @@ impl NodeConfig {
         self
     }
 
+    /// Enables Monad encrypted transactions with a test key derived from the trapdoor.
+    #[cfg(feature = "monad")]
+    #[must_use]
+    pub const fn with_monad_encryption_trapdoor(mut self, trapdoor: Option<U256>) -> Self {
+        self.monad_encryption_trapdoor = trapdoor;
+        self
+    }
+
     /// Enable Base network features.
     #[cfg(feature = "base")]
     #[must_use]
@@ -1454,6 +1467,19 @@ impl NodeConfig {
                 ReceiptEnvelope = foundry_primitives::FoundryReceiptEnvelope,
             >,
     {
+        // The test key decrypts a fresh local Monad chain only.
+        #[cfg(feature = "monad")]
+        if self.monad_encryption_trapdoor.is_some() {
+            eyre::ensure!(
+                self.networks.is_monad(),
+                "encrypted transactions require `--network monad`"
+            );
+            eyre::ensure!(
+                self.fork_urls.is_empty(),
+                "encrypted transactions cannot be used with forking"
+            );
+        }
+
         // configure the revm environment
 
         let mut cfg = CfgEnv::default();
