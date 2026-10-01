@@ -184,6 +184,8 @@ impl FoundryReceiptBuilder {
                     r#type: foundry_primitives::CIP64_TX_TYPE,
                 })
             }
+            #[cfg(feature = "monad")]
+            FoundryTxType::Encrypted => FoundryReceiptEnvelope::Encrypted(receipt),
         }
     }
 

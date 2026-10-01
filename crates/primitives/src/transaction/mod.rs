@@ -3,6 +3,8 @@ mod base;
 mod celo;
 #[cfg(any(feature = "base", feature = "optimism"))]
 mod deposit;
+#[cfg(feature = "monad")]
+mod encrypted;
 mod envelope;
 #[cfg(feature = "optimism")]
 mod optimism;
@@ -16,3 +18,6 @@ pub use request::{Cip64TransactionRequest, FoundryTransactionRequest, TempoTrans
 
 #[cfg(any(feature = "base", feature = "optimism"))]
 pub use deposit::get_deposit_tx_parts;
+
+#[cfg(feature = "monad")]
+pub use encrypted::{DecryptionFailure, DecryptionStatus, ENCRYPTED_TX_TYPE_ID, TxEncrypted};

@@ -134,6 +134,9 @@ use base_common_rpc_types::{BaseTransactionRequest, Eip8130Nonce};
 #[cfg(feature = "base")]
 use base_execution_eip8130::{FeeCheck, IntrinsicGas};
 
+#[cfg(feature = "monad")]
+use anvil_core::types::EncryptionContext;
+
 /// The client version: `anvil/v{major}.{minor}.{patch}`
 pub const CLIENT_VERSION: &str = concat!("anvil/v", env!("CARGO_PKG_VERSION"));
 
@@ -2640,6 +2643,10 @@ impl EthApi<FoundryNetwork> {
                 .anvil_set_fee_amm_liquidity(user_token, validator_token, amount)
                 .await
                 .to_rpc_result(),
+            #[cfg(feature = "monad")]
+            EthRequest::MonadGetEncryptionContext(()) => {
+                self.monad_get_encryption_context().to_rpc_result()
+            }
         }
     }
 
@@ -5488,6 +5495,8 @@ impl EthApi<FoundryNetwork> {
             FoundryTxEnvelope::Celo(_) => self.backend.ensure_cip64_active(),
             FoundryTxEnvelope::Legacy(_) => Ok(()),
             FoundryTxEnvelope::Tempo(_) => self.backend.ensure_tempo_active(),
+            #[cfg(feature = "monad")]
+            FoundryTxEnvelope::Encrypted(_) => self.backend.ensure_encrypted_transactions_active(),
         }
     }
 
@@ -5534,6 +5543,17 @@ impl EthApi<FoundryNetwork> {
         self.ensure_tempo_mode()?;
         self.backend.set_fee_amm_liquidity(user_token, validator_token, amount).await?;
         Ok(())
+    }
+
+    /// Returns the key and epoch that Monad encrypted transactions must use.
+    ///
+    /// Handler for RPC call: `monad_getEncryptionContext`
+    ///
+    /// Only available when running with `--monad.encrypted-transactions`.
+    #[cfg(feature = "monad")]
+    pub fn monad_get_encryption_context(&self) -> Result<EncryptionContext> {
+        node_info!("monad_getEncryptionContext");
+        self.backend.encryption_context().ok_or(BlockchainError::RpcUnimplemented)
     }
 
     /// Ensures anvil runs in Tempo mode (`--tempo`), the RPC method is unavailable otherwise.

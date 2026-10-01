@@ -19,6 +19,9 @@ use base_common_consensus::Eip8130Receipt;
 #[cfg(feature = "base")]
 use base_common_evm::EIP8130_TRANSACTION_TYPE;
 
+#[cfg(feature = "monad")]
+use crate::{DecryptionFailure, DecryptionStatus, ENCRYPTED_TX_TYPE_ID};
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, AsRef)]
 pub struct FoundryTxReceipt(pub WithOtherFields<TransactionReceipt<FoundryReceiptEnvelope<Log>>>);
 
@@ -77,6 +80,21 @@ impl FoundryTxReceipt {
     /// Adds a `feeToken` field to the receipt.
     pub fn with_fee_token(mut self, fee_token: Address) -> Self {
         self.0.other.insert("feeToken".to_string(), serde_json::to_value(fee_token).unwrap());
+        self
+    }
+
+    /// Adds an encrypted transaction's `decryptionStatus` field, and a `failureReason` field if it
+    /// failed.
+    #[cfg(feature = "monad")]
+    pub fn with_decryption(mut self, failure: Option<DecryptionFailure>) -> Self {
+        let status =
+            if failure.is_some() { DecryptionStatus::Failed } else { DecryptionStatus::Succeeded };
+        self.0.other.insert("decryptionStatus".to_string(), serde_json::to_value(status).unwrap());
+        if let Some(failure) = failure {
+            self.0
+                .other
+                .insert("failureReason".to_string(), serde_json::to_value(failure).unwrap());
+        }
         self
     }
 
@@ -199,6 +217,8 @@ impl TryFrom<AnyTransactionReceipt> for FoundryTxReceipt {
                         logs_bloom: receipt_with_bloom.logs_bloom,
                     }),
                     TEMPO_TX_TYPE_ID => FoundryReceiptEnvelope::Tempo(receipt_with_bloom),
+                    #[cfg(feature = "monad")]
+                    ENCRYPTED_TX_TYPE_ID => FoundryReceiptEnvelope::Encrypted(receipt_with_bloom),
                     #[cfg(any(feature = "base", feature = "optimism"))]
                     0x7E => build_deposit_receipt_envelope(receipt_with_bloom, &other),
                     // Chains anvil can fork but not execute, such as Arbitrum and its Orbit
@@ -253,6 +273,31 @@ mod tests {
                 .is_err()
         );
         assert!(FoundryTxReceipt::try_from(invalid).is_err());
+    }
+
+    #[cfg(feature = "monad")]
+    #[test]
+    fn encrypted_receipt_reports_its_decryption() {
+        let receipt: AnyTransactionReceipt = serde_json::from_value(serde_json::json!({
+            "type": "0x8", "status": "0x0", "cumulativeGasUsed": "0x1", "gasUsed": "0x1",
+            "logs": [], "logsBloom": alloy_primitives::Bloom::ZERO,
+            "transactionHash": B256::ZERO, "from": Address::ZERO
+        }))
+        .unwrap();
+        let receipt = FoundryTxReceipt::try_from(receipt).unwrap();
+        assert!(matches!(receipt.0.inner.inner, FoundryReceiptEnvelope::Encrypted(_)));
+
+        let failed = serde_json::to_value(
+            receipt.clone().with_decryption(Some(DecryptionFailure::InvalidPayload)),
+        )
+        .unwrap();
+        assert_eq!(
+            (&failed["type"], &failed["decryptionStatus"], &failed["failureReason"]),
+            (&"0x8".into(), &"failed".into(), &"invalidPayload".into())
+        );
+        let succeeded = serde_json::to_value(receipt.with_decryption(None)).unwrap();
+        assert_eq!(succeeded["decryptionStatus"], "succeeded");
+        assert_eq!(succeeded.get("failureReason"), None);
     }
 
     // <https://github.com/foundry-rs/foundry/issues/10852>

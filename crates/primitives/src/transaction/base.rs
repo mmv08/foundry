@@ -85,6 +85,10 @@ impl FromTxWithEncoded<FoundryTxEnvelope> for BaseTransaction<TxEnv> {
             }
             FoundryTxEnvelope::Tempo(_) => unreachable!("Tempo transaction in Base context"),
             FoundryTxEnvelope::Celo(_) => unreachable!("CIP-64 transaction in base context"),
+            #[cfg(feature = "monad")]
+            FoundryTxEnvelope::Encrypted(_) => {
+                unreachable!("encrypted transaction in Base context")
+            }
         }
     }
 }

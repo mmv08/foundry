@@ -220,6 +220,10 @@ impl FoundryTransactionRequest {
             }
             FoundryTxType::Tempo => self.complete_tempo(),
             FoundryTxType::Celo => self.as_ref().complete_1559(),
+            #[cfg(feature = "monad")]
+            FoundryTxType::Encrypted => {
+                Err(vec!["encrypted transactions require a signed raw transaction envelope"])
+            }
         }
     }
 
@@ -540,6 +544,9 @@ impl From<FoundryTypedTx> for FoundryTransactionRequest {
                 inner.transaction_type = Some(CIP64_TX_TYPE);
                 Self::Celo(Cip64TransactionRequest { inner, fee_currency: tx.fee_currency })
             }
+            // The fields as they appear on the wire, with the encrypted ones at their placeholders.
+            #[cfg(feature = "monad")]
+            FoundryTypedTx::Encrypted(tx) => Self::Ethereum(tx.to_eip1559().into()),
         }
     }
 }

@@ -99,6 +99,8 @@ impl FromRecoveredTx<FoundryTxEnvelope> for OpTransaction<TxEnv> {
             }
             FoundryTxEnvelope::Tempo(_) => unreachable!("Tempo tx in Optimism context"),
             FoundryTxEnvelope::Celo(_) => unreachable!("CIP-64 transaction in optimism context"),
+            #[cfg(feature = "monad")]
+            FoundryTxEnvelope::Encrypted(_) => unreachable!("encrypted tx in Optimism context"),
         }
     }
 }

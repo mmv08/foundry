@@ -12,6 +12,8 @@ mod eip4844;
 mod eip6110;
 mod eip7702;
 mod eip7928;
+#[cfg(feature = "monad")]
+mod encrypted;
 mod filter;
 mod fork;
 mod fork_bal;

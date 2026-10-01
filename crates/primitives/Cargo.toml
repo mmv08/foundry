@@ -72,3 +72,4 @@ optimism = [
     "dep:alloy-op-evm",
     "dep:op-revm",
 ]
+monad = []
