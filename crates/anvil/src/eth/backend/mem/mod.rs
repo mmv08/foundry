@@ -10103,7 +10103,7 @@ where
         self.validate_pool_transaction_for(tx, &account, &evm_env)?;
 
         #[cfg(feature = "monad")]
-        self.validate_encrypted_transaction(tx)?;
+        self.validate_encrypted_transaction(tx).await?;
 
         // Tempo charges gas in a fee token for every transaction type, never in the native token,
         // so the node's own pool validation replaces the native balance check skipped above.

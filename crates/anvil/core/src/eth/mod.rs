@@ -942,11 +942,6 @@ pub enum EthRequest {
         #[serde(deserialize_with = "deserialize_number")]
         U256,
     ),
-
-    /// Returns the key and epoch for Monad encrypted transactions
-    #[cfg(feature = "monad")]
-    #[serde(rename = "monad_getEncryptionContext", with = "empty_params")]
-    MonadGetEncryptionContext(()),
 }
 
 /// Represents ethereum JSON-RPC API

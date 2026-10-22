@@ -159,7 +159,6 @@ monad = [
     "dep:blake3",
     "dep:blst",
     "dep:monad-revm",
-    "anvil-core/monad",
     "foundry-primitives/monad",
     "foundry-config/monad",
     "foundry-evm/monad",

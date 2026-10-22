@@ -4,19 +4,22 @@ use alloy_consensus::{SignableTransaction, TxEip1559};
 use alloy_eips::eip2718::Encodable2718;
 use alloy_primitives::{Address, B256, Bytes, TxKind, U256, address, b256, bytes, hex};
 use alloy_provider::Provider;
-use alloy_rpc_types::{AccessList, AccessListItem, anvil::Forking};
+use alloy_rpc_types::{AccessList, AccessListItem, TransactionRequest, anvil::Forking};
 use alloy_signer::SignerSync;
 use alloy_signer_local::PrivateKeySigner;
+use alloy_sol_types::{SolCall, sol};
 use anvil::{NodeConfig, NodeHandle, eth::backend::btx::TestKey, spawn, try_spawn};
-use anvil_core::types::EncryptionContext;
 use foundry_common::provider::RetryProvider;
 use foundry_primitives::TxEncrypted;
+use monad_revm::staking::{STAKING_ADDRESS, storage::global_slots};
 use serde_json::{Value, json};
 
 /// The trapdoor of the SDK's fixtures and mock.
 const TRAPDOOR: u64 = 42;
-/// The one epoch Anvil serves.
-const EPOCH: u64 = 1;
+/// The epoch of a fresh chain, as the staking precompile reports it.
+const EPOCH: u64 = 0;
+/// The DKG contract, which publishes each epoch's encryption key.
+const DKG_ADDRESS: Address = address!("0x0000000000000000000000000000000000001002");
 /// Every field nodes accept encrypted: `to`, `input` and `access_list`.
 const ALL_FIELDS: u8 = 0x0d;
 /// Stores its first calldata word in slot 0, accepting any value.
@@ -32,6 +35,27 @@ const WORD: B256 = b256!("0x0000000000000000000000000000000000000000000000000000
 const GAS: u64 = 100_000;
 const MAX_FEE: u128 = 1_000_000_000_000;
 const PRIORITY_FEE: u128 = 1_000_000_000;
+
+sol! {
+    struct SignerBitmap {
+        bytes data;
+    }
+
+    struct QcCertificate {
+        SignerBitmap signers;
+        bytes32[8] signature;
+    }
+
+    struct DkgResult {
+        bytes32[18] bteKey;
+        QcCertificate certificate;
+    }
+
+    function dkgResult(uint64 epoch)
+        external
+        view
+        returns (bool exists, uint64 recordedBlock, DkgResult memory result);
+}
 
 /// Reads one of the SDK's fixtures (`monad-ts`), copied to `test-data/encrypted`.
 fn fixture(name: &str) -> Value {
@@ -132,35 +156,58 @@ fn quantity(value: u64) -> Value {
     json!(format!("{value:#x}"))
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn encryption_context_serves_the_fixture_key() {
-    let (_api, handle) = spawn(config()).await;
+/// Moves the staking precompile to `epoch`, which it stores in the first eight bytes of its slot.
+async fn set_epoch(provider: &RetryProvider, epoch: u64) {
+    let value = B256::right_padding_from(&epoch.to_be_bytes());
+    request(provider, "anvil_setStorageAt", json!([STAKING_ADDRESS, global_slots::EPOCH, value]))
+        .await;
+}
 
-    let context: EncryptionContext =
-        handle.http_provider().raw_request("monad_getEncryptionContext".into(), ()).await.unwrap();
-
-    // The SDK's first BTX vector uses the same trapdoor.
-    let vector = &fixture("btx-vectors.json")[0];
-    assert_eq!(vector["trapdoor"], format!("{TRAPDOOR:064x}"));
-    let encryption_key = hex::decode(vector["encryptionKey"].as_str().unwrap()).unwrap();
-    assert_eq!(
-        context,
-        EncryptionContext { epoch: EPOCH, encryption_key: encryption_key.into(), available: true }
-    );
+/// Calls `dkgResult` on the DKG contract, the read the SDK makes for an epoch's key.
+async fn dkg_result(provider: &RetryProvider, epoch: u64) -> Bytes {
+    let call = TransactionRequest::default()
+        .to(DKG_ADDRESS)
+        .input(Bytes::from(dkgResultCall { epoch }.abi_encode()).into());
+    provider.call(call.into()).await.unwrap()
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn encryption_context_needs_the_flag() {
+async fn dkg_contract_serves_the_key_of_the_current_epoch() {
+    let (_api, handle) = spawn(config()).await;
+    let provider = handle.http_provider();
+    // The SDK's first BTX vector uses the same trapdoor.
+    let vector = &fixture("btx-vectors.json")[0];
+    assert_eq!(vector["trapdoor"], format!("{TRAPDOOR:064x}"));
+
+    for epoch in [EPOCH, 7] {
+        set_epoch(&provider, epoch).await;
+
+        let current =
+            dkgResultCall::abi_decode_returns(&dkg_result(&provider, epoch).await).unwrap();
+        assert!(current.exists, "epoch {epoch}");
+        assert_eq!(current.recordedBlock, 0);
+        assert_eq!(
+            Bytes::from(current.result.bteKey.map(|word| word.0).concat()),
+            fixture_bytes(&vector["encryptionKey"])
+        );
+        // Unsigned by any validator set, the test key comes with an empty certificate.
+        assert_eq!(current.result.certificate.signers.data, Bytes::new());
+
+        for other in [epoch + 1, epoch.wrapping_sub(1)] {
+            let other =
+                dkgResultCall::abi_decode_returns(&dkg_result(&provider, other).await).unwrap();
+            assert!(!other.exists, "epoch {epoch}");
+            assert_eq!(other.result.bteKey, [B256::ZERO; 18]);
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn dkg_contract_needs_the_flag() {
     let (_api, handle) = spawn(NodeConfig::test_monad()).await;
 
-    let err = handle
-        .http_provider()
-        .raw_request::<_, EncryptionContext>("monad_getEncryptionContext".into(), ())
-        .await
-        .unwrap_err()
-        .to_string();
-
-    assert!(err.contains("Not implemented"), "unexpected error: {err}");
+    // Without the flag nothing lives at the address, so the call returns no data.
+    assert_eq!(dkg_result(&handle.http_provider(), EPOCH).await, Bytes::new());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -195,6 +242,8 @@ async fn sdk_vector_executes_under_its_original_identity() {
     let sender: Address = vector["sender"].as_str().unwrap().parse().unwrap();
     api.anvil_set_balance(sender, U256::from(10).pow(U256::from(18))).await.unwrap();
     api.anvil_set_nonce(sender, U256::from(7)).await.unwrap();
+    // The vector names epoch 1.
+    set_epoch(&provider, 1).await;
     let signed = fixture_bytes(&vector["signed"]);
 
     let receipt = send(&provider, &signed).await;
@@ -430,7 +479,8 @@ async fn admission_rejects_invalid_encrypted_transactions() {
     let mut tampered = ciphertext(&concealed, &payload, &signer, &key()).to_vec();
     *tampered.last_mut().unwrap() ^= 1;
     let tampered = seal(TxEncrypted { ciphertext: tampered.into(), ..concealed.clone() }, &signer);
-    let stale = sign(TxEncrypted { epoch: 2, ..concealed.clone() }, &payload, &signer, &key());
+    let next_epoch =
+        sign(TxEncrypted { epoch: EPOCH + 1, ..concealed.clone() }, &payload, &signer, &key());
     let unassigned = sign(
         TxEncrypted { encrypted_fields: 0x10, ..concealed.clone() },
         &payload,
@@ -458,7 +508,7 @@ async fn admission_rejects_invalid_encrypted_transactions() {
 
     for (raw, expected) in [
         (tampered, "invalid ciphertext: the client proof does not verify"),
-        (stale, "encryption epoch 2 is not the active epoch 1"),
+        (next_epoch, "encryption epoch 1 is not the active epoch 0"),
         (unassigned, "invalid encrypted transaction: encrypted_fields must name"),
         (encrypted_value, "invalid encrypted transaction: nodes do not accept an encrypted value"),
         (revealed, "invalid encrypted transaction: each encrypted field must show its placeholder"),
@@ -474,6 +524,30 @@ async fn admission_rejects_invalid_encrypted_transactions() {
         let err = rejection(&provider, &encrypted(call, ALL_FIELDS, &signer)).await;
         assert!(err.contains("encrypted transaction received but is not supported"), "{err}");
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_new_epoch_drops_pending_transactions_of_the_old_one() {
+    let (_handle, provider, signer, chain_id) = setup(config().with_no_mining(true)).await;
+    let transfer = |nonce| tx(chain_id, nonce, TxKind::Call(RECIPIENT), 1, Bytes::new());
+    let hash = submit(&provider, &encrypted(transfer(0), ALL_FIELDS, &signer)).await;
+
+    set_epoch(&provider, EPOCH + 1).await;
+    // Admission takes only the new epoch, and so does the next block: the pending transaction
+    // leaves the pool without being mined.
+    let err = rejection(&provider, &encrypted(transfer(1), ALL_FIELDS, &signer)).await;
+    assert!(err.contains("encryption epoch 0 is not the active epoch 1"), "{err}");
+    request(&provider, "evm_mine", json!([])).await;
+    assert_eq!(transaction(&provider, &hash).await, Value::Null);
+    assert_eq!(provider.get_transaction_count(signer.address()).await.unwrap(), 0);
+
+    // Encrypted again for the new epoch, the same transfer is mined.
+    let (concealed, payload) = TxEncrypted::from_eip1559(transfer(0), EPOCH + 1, ALL_FIELDS);
+    let hash = submit(&provider, &sign(concealed, &payload, &signer, &key())).await;
+    request(&provider, "evm_mine", json!([])).await;
+    let receipt = request(&provider, "eth_getTransactionReceipt", json!([hash])).await;
+    assert_eq!(receipt["status"], "0x1");
+    assert_eq!(balance(&provider, RECIPIENT).await, U256::from(1));
 }
 
 #[tokio::test(flavor = "multi_thread")]

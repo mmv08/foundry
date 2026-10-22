@@ -28,19 +28,19 @@ use alloy_eips::eip1559::BaseFeeParams;
 use alloy_evm::{
     Database, Evm, EvmEnv, EvmFactory, FromRecoveredTx, RecoveredTx,
     block::{
-        BalIndexedDatabase, BlockExecutionError, BlockExecutionResult, BlockExecutor, StateDB,
+        BalIndexedDatabase, BlockExecutionError, BlockExecutionResult, BlockExecutor,
+        BlockValidationError, StateDB,
     },
+    precompiles::{DynPrecompile, PrecompileInput, PrecompilesMap},
 };
 use alloy_monad_evm::{MonadContext, MonadEvm, MonadEvmFactory};
 use alloy_network::{AnyRpcTransaction, AnyTxEnvelope, BlockResponse, Network};
-use alloy_primitives::{Address, B256, Bytes, U256};
+use alloy_primitives::{Address, B256, Bytes, U256, address};
 use alloy_rpc_types::{AccessList, BlockNumberOrTag as BlockNumber, BlockTransactions};
-use anvil_core::{
-    eth::{
-        block::Block,
-        transaction::{MaybeImpersonatedTransaction, PendingTransaction},
-    },
-    types::EncryptionContext,
+use alloy_sol_types::{SolCall, sol};
+use anvil_core::eth::{
+    block::Block,
+    transaction::{MaybeImpersonatedTransaction, PendingTransaction},
 };
 use eyre::{Context, Result};
 use foundry_evm::{
@@ -58,7 +58,11 @@ use foundry_evm::{
 use foundry_primitives::{
     DecryptionFailure, DecryptionStatus, FoundryReceiptEnvelope, FoundryTxEnvelope, TxEncrypted,
 };
-use monad_revm::{MonadChainContext, MonadHardfork, instructions::monad_gas_params};
+use monad_revm::{
+    MonadChainContext, MonadHardfork,
+    instructions::monad_gas_params,
+    staking::{STAKING_ADDRESS, storage::global_slots},
+};
 use revm::{
     Inspector,
     context::{Transaction, TxEnv},
@@ -72,14 +76,40 @@ use revm::{
         transaction::AuthorizationTr,
     },
     database_interface::WrapDatabaseRef,
+    precompile::{
+        PrecompileError, PrecompileHalt, PrecompileId, PrecompileOutput, PrecompileResult,
+    },
     primitives::hardfork::SpecId,
     state::AccountInfo,
 };
 use std::sync::Arc;
 use tracing::{debug, warn};
 
-/// The one encryption epoch this node serves.
-const ENCRYPTION_EPOCH: u64 = 1;
+/// The DKG contract, where Monad nodes publish each epoch's encryption key.
+const DKG_ADDRESS: Address = address!("0x0000000000000000000000000000000000001002");
+/// What Monad nodes charge for `dkgResult`, whether or not the epoch has a key.
+const DKG_RESULT_GAS: u64 = 243_117;
+
+sol! {
+    struct SignerBitmap {
+        bytes data;
+    }
+
+    struct QcCertificate {
+        SignerBitmap signers;
+        bytes32[8] signature;
+    }
+
+    struct DkgResult {
+        bytes32[18] bteKey;
+        QcCertificate certificate;
+    }
+
+    function dkgResult(uint64 epoch)
+        external
+        view
+        returns (bool exists, uint64 recordedBlock, DkgResult memory result);
+}
 
 /// Resolved Monad inputs, including a transaction context for standalone calls.
 pub(super) struct PreparedExecution {
@@ -180,6 +210,21 @@ where
         // Admission requires the key; this guards paths that bypass it, such as `anvil_reorg`.
         let key = encryption_key
             .ok_or_else(|| BlockExecutionError::msg("encrypted transactions are not enabled"))?;
+        // A block includes only transactions for its own epoch, which can change after admission.
+        let active = executor
+            .evm_mut()
+            .db_mut()
+            .storage(STAKING_ADDRESS, global_slots::EPOCH)
+            .map_err(BlockExecutionError::other)?;
+        let active = staking_epoch(active);
+        if tx.tx().epoch != active {
+            let error = InvalidTransactionError::EncryptionEpoch { epoch: tx.tx().epoch, active };
+            return Err(BlockValidationError::InvalidTx {
+                hash: *tx.hash(),
+                error: Box::new(InvalidTransaction::Str(error.to_string().into())),
+            }
+            .into());
+        }
         let restored = decrypt(key, tx.tx(), recovered.signer());
         return execute_encrypted_transaction(executor, tx_env, recovered, restored);
     }
@@ -326,6 +371,64 @@ pub(super) fn show_decryption(
         Err(_) => DecryptionStatus::Failed,
     };
     fields.insert("decryptionStatus".to_string(), serde_json::to_value(status).unwrap());
+}
+
+/// Serves the DKG contract with the test key.
+fn dkg_contract(key: Arc<TestKey>) -> DynPrecompile {
+    DynPrecompile::new_stateful(PrecompileId::custom("MonadDkg"), move |input| {
+        dkg_result(&key, input)
+    })
+}
+
+/// Answers `dkgResult` of the DKG contract: the test key for the epoch the staking precompile
+/// reports as current, and no key for any other. No validators sign the test key, so its
+/// certificate is empty. The contract's other methods serve key generation, which Anvil does
+/// not run, so they revert.
+fn dkg_result(key: &TestKey, mut input: PrecompileInput<'_>) -> PrecompileResult {
+    // As on the nodes, a failed call reverts with its reason and uses all of its gas.
+    let (gas, reservoir) = (input.gas, input.reservoir);
+    let revert = |reason: &'static str| {
+        PrecompileOutput::revert(gas, Bytes::from_static(reason.as_bytes()), reservoir)
+    };
+    if !input.data.starts_with(&dkgResultCall::SELECTOR) {
+        return Ok(revert("method not supported"));
+    }
+    if gas < DKG_RESULT_GAS {
+        return Ok(PrecompileOutput::halt(PrecompileHalt::OutOfGas, reservoir));
+    }
+    if !input.value.is_zero() {
+        return Ok(revert("value is nonzero"));
+    }
+    let Ok(call) = dkgResultCall::abi_decode_validate(input.data) else {
+        return Ok(revert("input is invalid"));
+    };
+    let slot = input
+        .internals
+        .sload(STAKING_ADDRESS, global_slots::EPOCH)
+        .map_err(|err| PrecompileError::Fatal(err.to_string()))?
+        .data;
+    let exists = call.epoch == staking_epoch(slot);
+    let mut bte_key = [B256::ZERO; 18];
+    if exists {
+        for (word, chunk) in bte_key.iter_mut().zip(key.encryption_key().as_chunks().0) {
+            *word = B256::from(*chunk);
+        }
+    }
+    let result = DkgResult {
+        bteKey: bte_key,
+        certificate: QcCertificate {
+            signers: SignerBitmap { data: Bytes::new() },
+            signature: [B256::ZERO; 8],
+        },
+    };
+    let output =
+        dkgResultCall::abi_encode_returns(&dkgResultReturn { exists, recordedBlock: 0, result });
+    Ok(PrecompileOutput::new(DKG_RESULT_GAS, output.into(), reservoir))
+}
+
+/// Decodes the epoch the staking precompile stores in the first eight bytes of its slot.
+fn staking_epoch(slot: U256) -> u64 {
+    (slot >> 192_usize).to()
 }
 
 /// Adds a candidate transaction to the current Monad block context.
@@ -685,6 +788,7 @@ impl<N: Network> Backend<N> {
             .expect("Monad ancestor context must be available before block execution");
         evm.ctx_mut().chain = transaction_context;
         self.inject_precompiles(evm.precompiles_mut(), evm_env);
+        self.inject_dkg_contract(evm.precompiles_mut());
 
         let mut executor = AnvilBlockExecutor::new(evm, parent_hash, spec_id, None)
             .with_max_blob_gas_per_block(gas_config.max_blob_gas_per_block);
@@ -730,6 +834,7 @@ impl<N: Network> Backend<N> {
             MonadEvmFactory::default().create_evm_with_inspector(db, monad_env, inspector);
         evm.ctx_mut().chain = transaction_context;
         self.inject_precompiles(evm.precompiles_mut(), evm_env);
+        self.inject_dkg_contract(evm.precompiles_mut());
 
         let mut executor = AnvilBlockExecutor::new(evm, parent_hash, *evm_env.spec_id(), None)
             .with_state_changes();
@@ -1034,23 +1139,23 @@ impl<N: Network> Backend<N> {
     }
 
     /// Runs the static checks that encrypted transactions add, cheapest first: the encrypted
-    /// fields and their placeholders, the epoch, then the ciphertext's binding to the transaction
-    /// and its recovered sender.
-    pub(super) fn validate_encrypted_transaction(
+    /// fields and their placeholders, the epoch, which must be the staking precompile's current
+    /// one, then the ciphertext's binding to the transaction and its recovered sender.
+    pub(super) async fn validate_encrypted_transaction(
         &self,
         pending: &PendingTransaction<FoundryTxEnvelope>,
-    ) -> Result<(), InvalidTransactionError> {
+    ) -> Result<(), BlockchainError> {
         let FoundryTxEnvelope::Encrypted(tx) = pending.transaction.as_ref() else { return Ok(()) };
         let tx = tx.tx();
         tx.validate_encrypted_fields().map_err(InvalidTransactionError::EncryptedFields)?;
-        if tx.epoch != ENCRYPTION_EPOCH {
-            return Err(InvalidTransactionError::EncryptionEpoch {
-                epoch: tx.epoch,
-                active: ENCRYPTION_EPOCH,
-            });
+        let active =
+            staking_epoch(self.db.read().await.storage_ref(STAKING_ADDRESS, global_slots::EPOCH)?);
+        if tx.epoch != active {
+            return Err(InvalidTransactionError::EncryptionEpoch { epoch: tx.epoch, active }.into());
         }
         btx::admit(&tx.ciphertext, tx.associated_data(*pending.sender()).as_slice())
-            .map_err(InvalidTransactionError::Ciphertext)
+            .map_err(InvalidTransactionError::Ciphertext)?;
+        Ok(())
     }
 
     /// Derives a mined encrypted transaction's outcome again, as mining did: its restored fields,
@@ -1064,13 +1169,12 @@ impl<N: Network> Backend<N> {
         Some(decrypt(self.encryption_key.as_deref()?, tx.tx(), sender))
     }
 
-    /// Returns the key and epoch for encrypted transactions, or `None` when they are disabled.
-    pub(crate) fn encryption_context(&self) -> Option<EncryptionContext> {
-        self.encryption_key.as_ref().map(|key| EncryptionContext {
-            epoch: ENCRYPTION_EPOCH,
-            encryption_key: Bytes::copy_from_slice(key.encryption_key()),
-            available: true,
-        })
+    /// Serves the DKG contract when encrypted transactions are enabled.
+    fn inject_dkg_contract(&self, precompiles: &mut PrecompilesMap) {
+        if let Some(key) = &self.encryption_key {
+            let key = Arc::clone(key);
+            precompiles.apply_precompile(&DKG_ADDRESS, |_| Some(dkg_contract(key)));
+        }
     }
 
     /// Monad path of [`Backend::transact_call_with_inspector_ref`].
@@ -1092,6 +1196,7 @@ impl<N: Network> Backend<N> {
         let mut evm = factory.create_evm_with_inspector(WrapDatabaseRef(db), monad_env, inspector);
         evm.ctx_mut().chain = execution.context;
         self.inject_configured_precompiles(evm.precompiles_mut(), evm_env);
+        self.inject_dkg_contract(evm.precompiles_mut());
         match execution.kind {
             EnvelopeExecutionKind::Transaction => Ok(evm.transact(tx_env)?),
             EnvelopeExecutionKind::Replay => {
