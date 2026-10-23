@@ -154,6 +154,10 @@ impl Signer<foundry_primitives::FoundryNetwork> for DevSigner {
                 let sig = signer.sign_transaction_sync(&mut t)?;
                 FoundryTxEnvelope::Tempo(t.into_signed(sig.into()))
             }
+            #[cfg(feature = "monad")]
+            FoundryTypedTx::Encrypted(_) => {
+                unreachable!("encrypted transactions require a signed raw transaction envelope")
+            }
         };
         Ok(envelope)
     }

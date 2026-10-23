@@ -57,6 +57,10 @@ base-consensus-upgrades = { workspace = true, optional = true, features = ["std"
 base-execution-eip8130 = { workspace = true, optional = true }
 base-protocol = { workspace = true, optional = true, features = ["std"] }
 
+# monad
+blake3 = { version = "1", optional = true }
+blst = { version = "0.3", optional = true }
+
 # alloy
 alloy-evm = { workspace = true, features = ["call-util"] }
 alloy-op-evm = { workspace = true, optional = true }
@@ -152,7 +156,10 @@ tempo-alloy.workspace = true
 default = ["cli", "jemalloc", "asm-keccak", "optimism", "js-tracer"]
 monad = [
     "dep:alloy-monad-evm",
+    "dep:blake3",
+    "dep:blst",
     "dep:monad-revm",
+    "foundry-primitives/monad",
     "foundry-config/monad",
     "foundry-evm/monad",
     "foundry-evm-networks/monad",

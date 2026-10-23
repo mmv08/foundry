@@ -1,0 +1,77 @@
+{
+  "source": "category-labs/monad-bft-private@71a4400bc82e2879acfcd064de5472b098b0e593:monad-encrypted-tx/test-vectors/btx-conformance-v1.txt",
+  "ciphertext": "97f1d3a73197d7942695638c4fa9ac0fc3688c4f9774b905a14e3a3f171bac586c55e83ff97a1aeffb3af00adb22c6bb000102030405060708090a0b0c0d0e0f0000000a63697068657274657874652b9f29334620e1e08374a8733189b97d9b721f14bed2901c834949376fa2210ec20829f6575c6652b6635f96704e4bd62231e3eb3f896ee37cb6b5c8905de2",
+  "ad": "6173736f6369617465642d64617461",
+  "cases": [
+    { "name": "admission_valid", "expect": "ok" },
+    {
+      "name": "admission_truncated",
+      "expect": "invalid_length",
+      "truncate": 1
+    },
+    {
+      "name": "admission_trailing_data",
+      "expect": "invalid_length",
+      "append": "00"
+    },
+    {
+      "name": "admission_invalid_point",
+      "expect": "invalid_point",
+      "offset": 0,
+      "replace": "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+    },
+    {
+      "name": "admission_non_subgroup_point",
+      "expect": "invalid_point",
+      "offset": 0,
+      "replace": "80803f0d09fec09a95f2ee7495323c15c162270c7cceaffa8566e941c66bcf206e72955d58b3b32e564de3209d672ca5"
+    },
+    {
+      "name": "admission_identity_point",
+      "expect": "identity_point",
+      "offset": 0,
+      "replace": "c00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+    },
+    {
+      "name": "admission_noncanonical_scalar",
+      "expect": "invalid_scalar",
+      "offset": 78,
+      "replace": "73eda753299d7d483339d80809a1d80553bda402fffe5bfeffffffff00000001"
+    },
+    {
+      "name": "admission_noncanonical_response",
+      "expect": "invalid_scalar",
+      "offset": 110,
+      "replace": "73eda753299d7d483339d80809a1d80553bda402fffe5bfeffffffff00000001"
+    },
+    {
+      "name": "admission_zero_scalar_is_canonical",
+      "expect": "client_nizk_failed",
+      "offset": 78,
+      "replace": "0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    {
+      "name": "admission_one_scalar_is_canonical",
+      "expect": "client_nizk_failed",
+      "offset": 78,
+      "replace": "0000000000000000000000000000000000000000000000000000000000000001"
+    },
+    {
+      "name": "admission_r_minus_one_scalar_is_canonical",
+      "expect": "client_nizk_failed",
+      "offset": 78,
+      "replace": "73eda753299d7d483339d80809a1d80553bda402fffe5bfeffffffff00000000"
+    },
+    {
+      "name": "admission_tampered_ciphertext",
+      "expect": "client_nizk_failed",
+      "offset": 68,
+      "replace": "62"
+    },
+    {
+      "name": "admission_associated_data_mismatch",
+      "expect": "client_nizk_failed",
+      "ad": "77726f6e672d6173736f6369617465642d64617461"
+    }
+  ]
+}

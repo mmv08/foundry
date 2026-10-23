@@ -43,6 +43,8 @@ use forking must contain `fork` in their name. Forge and Cast CLI tests live und
 - [External compiler adapters](./external-compiler-adapters.md) defines the executable protocol,
   cache contract, and artifact integration for compiler-native EVM projects.
 - [Lint rules](./lintrules.md) covers the lint registry, UI fixtures, and documentation contract.
+- [Monad encrypted transactions](./monad-encrypted-transactions.md) covers the experimental Anvil
+  mode for type `0x08`: its flag, test key, development defaults, and limits.
 - [Custom EVM integrations](./networks.md) describes network selection, execution ownership,
   state lifecycles, tool dispatch, and CI coverage.
 - [Output channels](./output-channels.md) defines the stdout/stderr contract for Foundry commands.

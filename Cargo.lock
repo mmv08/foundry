@@ -1346,6 +1346,8 @@ dependencies = [
  "base-consensus-upgrades",
  "base-execution-eip8130",
  "base-protocol",
+ "blake3",
+ "blst",
  "chrono",
  "clap",
  "clap_complete",

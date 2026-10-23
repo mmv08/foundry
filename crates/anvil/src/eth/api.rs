@@ -5488,6 +5488,8 @@ impl EthApi<FoundryNetwork> {
             FoundryTxEnvelope::Celo(_) => self.backend.ensure_cip64_active(),
             FoundryTxEnvelope::Legacy(_) => Ok(()),
             FoundryTxEnvelope::Tempo(_) => self.backend.ensure_tempo_active(),
+            #[cfg(feature = "monad")]
+            FoundryTxEnvelope::Encrypted(_) => self.backend.ensure_encrypted_transactions_active(),
         }
     }
 
