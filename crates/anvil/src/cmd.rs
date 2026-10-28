@@ -691,7 +691,7 @@ pub struct AnvilEvmArgs {
     /// Enable the transaction gas limit check as imposed by EIP-7825 (Osaka hardfork).
     ///
     /// From Amsterdam, the cap always applies to regular gas only, and gas above it becomes the
-    /// EIP-8037 state gas reservoir.
+    /// EIP-8037 state gas reservoir. Monad always enforces its own 30,000,000 gas cap.
     #[arg(long, visible_alias = "tx-gas-limit", help_heading = "Environment config")]
     pub enable_tx_gas_limit: bool,
 

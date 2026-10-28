@@ -257,7 +257,7 @@ pub struct NodeConfig {
     /// If set to `true`, disables the block gas limit
     pub disable_block_gas_limit: bool,
     /// If set to `true`, enables the tx gas limit as imposed by Osaka (EIP-7825). From Amsterdam,
-    /// the cap always applies to regular gas only (EIP-8037).
+    /// the cap always applies to regular gas only (EIP-8037). Monad always enforces its own cap.
     pub enable_tx_gas_limit: bool,
     /// Default gas price for all txs
     pub gas_price: Option<u128>,
@@ -776,13 +776,15 @@ impl NodeConfig {
     /// The Amsterdam gas features follow the spec in both directions, so switching to an earlier
     /// spec disables them. The EIP-7825 cap is lifted unless `enable_tx_gas_limit` is set, except
     /// under EIP-8037, where the cap divides a transaction's gas into regular gas and the state
-    /// gas reservoir instead of limiting it.
+    /// gas reservoir instead of limiting it, and on Monad, whose consensus always enforces its own
+    /// cap.
     pub(crate) fn set_cfg_spec(&self, cfg: &mut CfgEnv, spec: SpecId) {
         cfg.set_spec_and_mainnet_gas_params(spec);
         let is_amsterdam = spec >= SpecId::AMSTERDAM;
         cfg.enable_amsterdam_eip8037 = is_amsterdam;
         cfg.enable_amsterdam_eip2780 = is_amsterdam;
-        cfg.tx_gas_limit_cap = (!self.enable_tx_gas_limit && !is_amsterdam).then_some(u64::MAX);
+        let enforces_cap = self.enable_tx_gas_limit || is_amsterdam || self.networks.is_monad();
+        cfg.tx_gas_limit_cap = (!enforces_cap).then_some(u64::MAX);
     }
 
     /// Returns the memory limit of the node

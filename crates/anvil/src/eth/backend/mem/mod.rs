@@ -1917,7 +1917,7 @@ impl<N: Network> Backend<N> {
     ///
     /// Under EIP-8037 the cap only bounds regular gas, and gas above it becomes the state gas
     /// reservoir, so the gas limit itself is not capped.
-    fn enforced_tx_gas_limit_cap(&self, evm_env: &EvmEnv) -> Option<u64> {
+    pub(crate) fn enforced_tx_gas_limit_cap(&self, evm_env: &EvmEnv) -> Option<u64> {
         if evm_env.cfg_env.tx_gas_limit_cap.is_some()
             || evm_env.cfg_env.is_amsterdam_eip8037_enabled()
         {

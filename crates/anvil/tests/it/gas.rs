@@ -1021,3 +1021,35 @@ async fn test_amsterdam_state_gas_reservoir() {
         assert_eq!(U256::from_be_slice(&output), expected_gasleft);
     }
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_estimate_gas_within_tx_gas_limit_cap() {
+    // Initcode that loops 675,000 times at 26 gas a round, about 17.6M gas, and deploys no code.
+    let loop_code = bytes!("620a4cb85b600190038060045700");
+
+    for enable_tx_gas_limit in [false, true] {
+        let (_api, handle) = spawn(
+            NodeConfig::test()
+                .with_hardfork(Some(EthereumHardfork::Osaka.into()))
+                .enable_tx_gas_limit(enable_tx_gas_limit),
+        )
+        .await;
+        let provider = handle.http_provider();
+        let from = handle.dev_accounts().next().unwrap();
+
+        let deploy =
+            TransactionRequest::default().with_from(from).with_deploy_code(loop_code.clone());
+        let estimate = provider.estimate_gas(WithOtherFields::new(deploy)).await;
+        if enable_tx_gas_limit {
+            assert_eq!(
+                estimate.unwrap_err().to_string(),
+                format!(
+                    "server returned an error response: error code -32003: Out of gas: gas required exceeds allowance: {TX_GAS_LIMIT_CAP}"
+                )
+            );
+        } else {
+            let estimate = estimate.unwrap();
+            assert!(estimate > TX_GAS_LIMIT_CAP, "{estimate}");
+        }
+    }
+}

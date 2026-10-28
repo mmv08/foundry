@@ -1647,7 +1647,7 @@ async fn monad_can_mine_contract_larger_than_eip3860_initcode_limit() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn monad_allows_tx_gas_limit_above_eip7825_cap() {
-    let config = monad_eight_config().enable_tx_gas_limit(true);
+    let config = monad_nine_config();
     let (_api, handle) = spawn(config).await;
     let provider = handle.http_provider();
     let accounts = provider.get_accounts().await.unwrap();
@@ -1666,7 +1666,7 @@ async fn monad_allows_tx_gas_limit_above_eip7825_cap() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn monad_rejects_tx_gas_limit_above_monad_cap() {
-    let config = monad_eight_config().enable_tx_gas_limit(true).with_gas_limit(Some(40_000_000));
+    let config = monad_eight_config().with_gas_limit(Some(40_000_000));
     let (_api, handle) = spawn(config).await;
     let provider = handle.http_provider();
     let accounts = provider.get_accounts().await.unwrap();
@@ -1683,7 +1683,7 @@ async fn monad_rejects_tx_gas_limit_above_monad_cap() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn monad_omitted_gas_fallback_uses_resolved_tx_gas_cap() {
-    let config = monad_eight_config().enable_tx_gas_limit(true).with_gas_limit(Some(40_000_000));
+    let config = monad_eight_config().with_gas_limit(Some(40_000_000));
     let (_api, handle) = spawn(config).await;
     let provider = handle.http_provider();
     let from = provider.get_accounts().await.unwrap()[0];
@@ -1693,6 +1693,41 @@ async fn monad_omitted_gas_fallback_uses_resolved_tx_gas_cap() {
     let sent = provider.get_transaction_by_hash(*pending.tx_hash()).await.unwrap().unwrap();
 
     assert_eq!(sent.inner.gas_limit(), MONAD_TX_GAS_LIMIT_CAP);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn monad_estimate_gas_within_monad_tx_gas_cap() {
+    let config = monad_nine_config().with_gas_limit(Some(200_000_000));
+    let (_api, handle) = spawn(config).await;
+    let provider = handle.http_provider();
+    let from = provider.get_accounts().await.unwrap()[0];
+
+    // Initcode that loops 675,000 times at 26 gas a round, about 17.6M gas, and deploys no code.
+    let deploy = TransactionRequest::default()
+        .with_from(from)
+        .with_deploy_code(bytes!("620a4cb85b600190038060045700"));
+    let estimate = provider.estimate_gas(deploy.clone().into()).await.unwrap();
+    assert!(estimate > EIP7825_TX_GAS_LIMIT_CAP, "{estimate}");
+    let receipt = provider
+        .send_transaction(deploy.with_gas_limit(estimate).into())
+        .await
+        .unwrap()
+        .get_receipt()
+        .await
+        .unwrap();
+    assert!(receipt.status());
+
+    // Initcode that loops 1,200,000 times at 26 gas a round, about 31.2M gas.
+    let deploy = TransactionRequest::default()
+        .with_from(from)
+        .with_deploy_code(bytes!("62124f805b600190038060045700"));
+    let err = provider.estimate_gas(deploy.into()).await.unwrap_err().to_string();
+    assert_eq!(
+        err,
+        format!(
+            "server returned an error response: error code -32003: Out of gas: gas required exceeds allowance: {MONAD_TX_GAS_LIMIT_CAP}"
+        )
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
