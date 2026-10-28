@@ -2,11 +2,7 @@ use alloy_consensus::{
     SidecarBuilder, SignableTransaction, SimpleCoder, Transaction, TxEip1559, TxLegacy,
     transaction::TxEip7702,
 };
-use alloy_eips::{
-    calc_next_block_base_fee,
-    eip1559::BaseFeeParams,
-    eip2718::{Decodable2718, Encodable2718},
-};
+use alloy_eips::eip2718::{Decodable2718, Encodable2718};
 use alloy_network::{
     ReceiptResponse, TransactionBuilder, TransactionBuilder4844, TransactionResponse, TxSignerSync,
 };
@@ -82,6 +78,8 @@ const EIP170_CODE_SIZE_LIMIT: usize = 0x6000;
 const EIP3860_INITCODE_SIZE_LIMIT: usize = 0xc000;
 const EIP7825_TX_GAS_LIMIT_CAP: u64 = 0x1000000;
 const MONAD_TX_GAS_LIMIT_CAP: u64 = 30_000_000;
+const MONAD_MIN_BASE_FEE: u64 = 100_000_000_000;
+const MONAD_GAS_PRICE: u128 = MONAD_MIN_BASE_FEE as u128 + 1_000_000_000;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn monad_nine_exposes_reserve_balance_precompile_for_calls() {
@@ -550,7 +548,7 @@ async fn monad_reorg_replays_protocol_system_envelopes() {
         .with_nonce(0)
         .with_value(transfer)
         .with_gas_limit(21_000)
-        .with_gas_price(2_000_000_000);
+        .with_gas_price(MONAD_GAS_PRICE);
     let snapshot_tx = monad_protocol_transaction(
         SYSTEM_NONCE + 1,
         U256::ZERO,
@@ -810,7 +808,7 @@ async fn monad_reorg_rolls_back_failed_protocol_prestate() {
         .with_nonce(0)
         .with_value(U256::ONE)
         .with_gas_limit(21_000)
-        .with_gas_price(2_000_000_000);
+        .with_gas_price(MONAD_GAS_PRICE);
     // Reuse the failed envelope's nonce. This can only succeed if replay restores the protocol
     // nonce and mint before the next candidate is validated and executed.
     let snapshot_tx = monad_protocol_transaction(
@@ -936,7 +934,7 @@ async fn monad_reorg_rejects_malformed_and_non_replay_system_envelopes() {
         .with_nonce(0)
         .with_value(U256::ONE)
         .with_gas_limit(21_000)
-        .with_gas_price(2_000_000_000);
+        .with_gas_price(MONAD_GAS_PRICE);
     api.anvil_reorg(ReorgOptions {
         depth: 1,
         tx_block_pairs: vec![
@@ -1053,20 +1051,20 @@ async fn monad_fork_transaction_hash_replays_protocol_system_prefix_and_target()
             .with_value(reward)
             .with_input(Bytes::from(syscallRewardCall { blockAuthor: BLOCK_AUTHOR }.abi_encode()))
             .with_gas_limit(1_000_000)
-            .with_gas_price(2_000_000_000)
+            .with_gas_price(MONAD_GAS_PRICE)
     };
     let first_reward = origin_provider.send_transaction(reward_tx(11).into()).await.unwrap();
     let first_reward_hash = *first_reward.tx_hash();
     let first_probe = origin_provider
         .send_transaction(
-            reserve_probe_tx(participant, 0, 0, mon(2)).with_gas_price(2_000_000_000).into(),
+            reserve_probe_tx(participant, 0, 0, mon(2)).with_gas_price(MONAD_GAS_PRICE).into(),
         )
         .await
         .unwrap();
     let first_probe_hash = *first_probe.tx_hash();
     let second_probe = origin_provider
         .send_transaction(
-            reserve_probe_tx(participant, 1, 1, mon(1)).with_gas_price(2_000_000_000).into(),
+            reserve_probe_tx(participant, 1, 1, mon(1)).with_gas_price(MONAD_GAS_PRICE).into(),
         )
         .await
         .unwrap();
@@ -1401,15 +1399,8 @@ async fn monad_fork_transaction_hash_rollback_restores_inferred_profile() {
         api.backend.evm_env().read().block_env.basefee,
         parent.header.base_fee_per_gas.unwrap()
     );
-    assert_eq!(
-        api.backend.base_fee(),
-        calc_next_block_base_fee(
-            parent.header.gas_used,
-            parent.header.gas_limit,
-            parent.header.base_fee_per_gas.unwrap(),
-            BaseFeeParams::ethereum(),
-        )
-    );
+    // Monad's controller holds the base fee at its floor while blocks stay below the target.
+    assert_eq!(api.backend.base_fee(), MONAD_MIN_BASE_FEE);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1447,15 +1438,8 @@ async fn monad_fork_transaction_hash_reorg_restores_inferred_profile() {
         api.backend.blob_params(),
         get_blob_params(MONAD_TESTNET_CHAIN_ID, block.header.timestamp)
     );
-    assert_eq!(
-        api.backend.base_fee(),
-        calc_next_block_base_fee(
-            block.header.gas_used,
-            block.header.gas_limit,
-            block.header.base_fee_per_gas.unwrap(),
-            BaseFeeParams::ethereum(),
-        )
-    );
+    // Monad's controller holds the base fee at its floor while blocks stay below the target.
+    assert_eq!(api.backend.base_fee(), MONAD_MIN_BASE_FEE);
     let state = api.serialized_state(false).await.unwrap();
     assert_eq!(
         state.monad_block_replay_profiles[&block.header.hash].hardfork,
@@ -1506,7 +1490,7 @@ async fn monad_mining_tracks_eip7702_authorities() {
         chain_id: 31337,
         nonce: 0,
         gas_limit: 100_000,
-        max_fee_per_gas: 2_000_000_000,
+        max_fee_per_gas: MONAD_GAS_PRICE,
         max_priority_fee_per_gas: 1_000_000_000,
         to: wallets[2].address(),
         authorization_list: vec![authorization.into_signed(signature)],
@@ -1524,7 +1508,7 @@ async fn monad_mining_tracks_eip7702_authorities() {
         chain_id: 31337,
         nonce: 1,
         gas_limit: 100_000,
-        max_fee_per_gas: 2_000_000_000,
+        max_fee_per_gas: MONAD_GAS_PRICE,
         max_priority_fee_per_gas: 1_000_000_000,
         to: TxKind::Call(RESERVE_PROBE_ADDRESS),
         value: U256::from(3_000_000_000_000_000_000u128),
@@ -1748,6 +1732,62 @@ async fn monad_pool_admits_unaffordable_value_for_failed_receipt() {
 
     assert!(!receipt.status());
     assert_eq!(provider.get_balance(accounts[1]).await.unwrap(), recipient_balance);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn monad_base_fee_follows_monad_controller() {
+    // Expected values come from monad-bft's `monad_tfm::base_fee::compute_base_fee`.
+    const BLOCK_TWO_BASE_FEE: u64 = 100_599_040_943;
+    const BLOCK_THREE_BASE_FEE: u64 = 101_203_266_608;
+    let config = monad_nine_config().with_gas_limit(Some(50_000));
+    let (api, handle) = spawn(config.clone()).await;
+    let provider = handle.http_provider();
+    let accounts = provider.get_accounts().await.unwrap();
+
+    // Blocks one and two each use 42,000 gas, above the 40,000 target, and later blocks are empty.
+    api.anvil_set_auto_mine(false).await.unwrap();
+    for _ in 0..2 {
+        for from in &accounts[..2] {
+            let tx = TransactionRequest::default()
+                .with_from(*from)
+                .with_to(accounts[2])
+                .with_gas_limit(21_000);
+            let _ = provider.send_transaction(tx.into()).await.unwrap();
+        }
+        api.mine_one().await.unwrap();
+    }
+    let snapshot = api.evm_snapshot().await.unwrap();
+    api.mine_one().await.unwrap();
+    api.mine_one().await.unwrap();
+
+    let mut base_fees = Vec::new();
+    for number in 0..=4 {
+        let block =
+            provider.get_block_by_number(BlockNumberOrTag::Number(number)).await.unwrap().unwrap();
+        base_fees.push(block.header.base_fee_per_gas.unwrap());
+    }
+    assert_eq!(
+        base_fees,
+        [
+            MONAD_MIN_BASE_FEE,
+            MONAD_MIN_BASE_FEE,
+            BLOCK_TWO_BASE_FEE,
+            BLOCK_THREE_BASE_FEE,
+            MONAD_MIN_BASE_FEE
+        ]
+    );
+
+    // Rewinding to block two restores the controller state that block carries.
+    assert!(api.evm_revert(snapshot).await.unwrap());
+    assert_eq!(api.backend.base_fee(), BLOCK_THREE_BASE_FEE);
+    api.mine_one().await.unwrap();
+    api.anvil_rollback(Some(1)).await.unwrap();
+    assert_eq!(api.backend.base_fee(), BLOCK_THREE_BASE_FEE);
+
+    let state = api.serialized_state(false).await.unwrap();
+    let (loaded_api, _) =
+        spawn(config.with_genesis_accounts(Vec::new()).with_init_state(Some(state))).await;
+    assert_eq!(loaded_api.backend.base_fee(), BLOCK_THREE_BASE_FEE);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2373,13 +2413,13 @@ async fn monad_fork_rollback_to_root_preserves_startup_overrides() {
     let (source_api, source) = spawn(
         monad_nine_config()
             .with_no_mining(true)
-            .with_base_fee(Some(1_000_000_000))
+            .with_base_fee(Some(MONAD_MIN_BASE_FEE))
             .with_gas_limit(Some(30_000_000)),
     )
     .await;
     source_api.mine_one().await.unwrap();
     let root = source.http_provider().get_block(1.into()).await.unwrap().unwrap();
-    assert_eq!(root.header.base_fee_per_gas, Some(1_000_000_000));
+    assert_eq!(root.header.base_fee_per_gas, Some(MONAD_MIN_BASE_FEE));
     assert_eq!(root.header.gas_limit, 30_000_000);
 
     let (api, handle) = spawn(

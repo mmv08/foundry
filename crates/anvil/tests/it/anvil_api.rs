@@ -2221,10 +2221,10 @@ async fn can_get_node_info_monad() {
         hard_fork: "MonadEight".to_string(),
         transaction_order: "fees".to_owned(),
         environment: NodeEnvironment {
-            base_fee: U256::from_str("0x3b9aca00").unwrap().to(),
+            base_fee: 100_000_000_000,
             chain_id: 31337,
             gas_limit: 30_000_000,
-            gas_price: U256::from_str("0x77359400").unwrap().to(),
+            gas_price: 101_000_000_000,
         },
         fork_config: NodeForkConfig {
             fork_url: None,

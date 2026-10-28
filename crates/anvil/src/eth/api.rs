@@ -4575,9 +4575,9 @@ impl EthApi<FoundryNetwork> {
         // Price fee-less transactions for the blocks mined on top of the common block, not for the
         // head that is about to be discarded.
         let fee_defaults = fee_defaults.or_else(|| {
-            let (base_fee, blob_fees) = self.backend.next_block_fees_after(&common_block.header);
+            let (fees, blob_fees) = self.backend.next_block_fees_after(&common_block.header);
             Some(TransactionFeeDefaults {
-                gas_price: self.gas_price_for_base_fee(base_fee),
+                gas_price: self.gas_price_for_base_fee(fees.base_fee),
                 blob_gas_price: self
                     .backend
                     .fees()

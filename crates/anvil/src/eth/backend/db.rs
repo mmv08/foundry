@@ -53,6 +53,9 @@ pub struct MonadBlockReplayProfile {
     pub execution_chain_id: u64,
     /// Monad hardfork active when the block was executed.
     pub hardfork: foundry_evm::hardfork::MonadHardfork,
+    /// Base fee controller state the block carries in its Monad consensus header.
+    #[serde(default)]
+    pub base_fee_state: crate::eth::fees::MonadBaseFeeState,
 }
 
 /// Inserts a block hash, discards entries outside the EVM-visible cache, and returns its head.

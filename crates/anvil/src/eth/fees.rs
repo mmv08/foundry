@@ -21,8 +21,11 @@ use tempo_hardfork::{TempoHardfork, constants::gas::tempo_t7_next_block_base_fee
 #[cfg(feature = "optimism")]
 use foundry_evm::hardfork::OpHardfork;
 
+mod monad;
 #[cfg(feature = "optimism")]
 mod optimism;
+
+pub use monad::{MONAD_MIN_BASE_FEE, MonadBaseFeeState};
 
 /// Maximum number of entries in the fee history cache
 pub const MAX_FEE_HISTORY_CACHE_SIZE: u64 = 2048u64;
@@ -131,6 +134,7 @@ impl BaseFeeRules {
                     extra_data: inherited
                         .map_or_else(Bytes::new, optimism::OptimismBaseFeeRules::extra_data),
                     optimism_jovian: inherited.map(optimism::OptimismBaseFeeRules::is_jovian),
+                    monad: None,
                 }
             }
         }
@@ -145,6 +149,8 @@ pub(crate) struct ParentHeaderFees {
     pub(crate) extra_data: Bytes,
     /// Whether the decoded Optimism fee parameters activate Jovian.
     pub(crate) optimism_jovian: Option<bool>,
+    /// Monad base fee controller state carried by the child block.
+    pub(crate) monad: Option<MonadBaseFeeState>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -153,6 +159,8 @@ struct FeeState {
     blob_params: BlobParams,
     /// Base fee for the next block.
     base_fee: u64,
+    /// Monad base fee controller state carried by the next block, set only on Monad chains.
+    monad: Option<MonadBaseFeeState>,
     /// Excess blob gas and price for the next block.
     blob_excess_gas_and_price: BlobExcessGasAndPrice,
     /// Legacy gas price.
@@ -164,6 +172,7 @@ struct FeeState {
 pub(crate) struct FeeSnapshot {
     pub(crate) base_fee: u64,
     pub(crate) blob_excess_gas_and_price: BlobExcessGasAndPrice,
+    pub(crate) monad: Option<MonadBaseFeeState>,
 }
 
 impl FeeManager {
@@ -187,6 +196,7 @@ impl FeeManager {
                 },
                 blob_params,
                 base_fee,
+                monad: None,
                 blob_excess_gas_and_price,
                 gas_price,
             })),
@@ -213,6 +223,7 @@ impl FeeManager {
         FeeSnapshot {
             base_fee: state.base_fee,
             blob_excess_gas_and_price: state.blob_excess_gas_and_price,
+            monad: state.monad,
         }
     }
 
@@ -221,23 +232,54 @@ impl FeeManager {
         let mut state = self.state.write();
         state.base_fee = snapshot.base_fee;
         state.blob_excess_gas_and_price = snapshot.blob_excess_gas_and_price;
+        state.monad = snapshot.monad;
     }
 
     /// Atomically publishes the chain-derived fee state for the next block.
     pub(crate) fn set_next_block_fees(
         &self,
-        base_fee: u64,
+        fees: &ParentHeaderFees,
         blob_excess_gas_and_price: BlobExcessGasAndPrice,
     ) {
         trace!(
             target: "backend::fees",
-            ?base_fee,
+            base_fee = ?fees.base_fee,
+            monad = ?fees.monad,
             ?blob_excess_gas_and_price,
             "updated next block fees"
         );
         let mut state = self.state.write();
-        state.base_fee = base_fee;
+        state.base_fee = fees.base_fee;
+        state.monad = fees.monad.or(state.monad);
         state.blob_excess_gas_and_price = blob_excess_gas_and_price;
+    }
+
+    /// Publishes the base fee, and on Monad the controller state, that the next block inherits.
+    pub(crate) fn set_next_block_base_fee(&self, fees: &ParentHeaderFees) {
+        let mut state = self.state.write();
+        state.base_fee = fees.base_fee;
+        state.monad = fees.monad.or(state.monad);
+    }
+
+    /// Returns the Monad base fee controller state carried by the next block.
+    pub(crate) fn monad_base_fee_state(&self) -> Option<MonadBaseFeeState> {
+        self.state.read().monad
+    }
+
+    /// Sets the Monad base fee controller state carried by the next block, which also selects
+    /// Monad's base fee rule.
+    pub(crate) fn set_monad_base_fee_state(&self, monad: MonadBaseFeeState) {
+        self.state.write().monad = Some(monad);
+    }
+
+    /// Returns an independent copy whose next block carries `monad` on a Monad chain, for deriving
+    /// the fees that the child of a stored block inherits.
+    pub(crate) fn with_monad_base_fee_state(&self, monad: MonadBaseFeeState) -> Self {
+        let fees = self.detached();
+        if let Some(state) = &mut fees.state.write().monad {
+            *state = monad;
+        }
+        fees
     }
 
     /// Returns the active Tempo hardfork, if running a Tempo chain.
@@ -369,23 +411,14 @@ impl FeeManager {
         if !state.rules.spec_id.is_enabled_in(SpecId::LONDON) || state.base_fee == 0 {
             return 0;
         }
-        calculate_next_block_base_fee_per_gas(state.rules, gas_used, gas_limit, last_fee_per_gas)
-    }
-
-    /// Calculates the next block base fee from a complete parent header.
-    pub(crate) fn get_next_block_base_fee_from_header<H: BlockHeader>(&self, header: &H) -> u64 {
-        let state = self.state.read();
-        if !state.rules.spec_id.is_enabled_in(SpecId::LONDON) || state.base_fee == 0 {
-            return 0;
-        }
-        calculate_parent_header_fees(state.rules, header).base_fee
+        calculate_next_block_base_fee_per_gas(&state, gas_used, gas_limit, last_fee_per_gas)
     }
 
     /// Returns all fee metadata inherited from a parent header, honoring the configured zero-fee
     /// sentinel.
     pub(crate) fn get_parent_header_fees<H: BlockHeader>(&self, header: &H) -> ParentHeaderFees {
         let state = self.state.read();
-        let mut fees = calculate_parent_header_fees(state.rules, header);
+        let mut fees = calculate_parent_header_fees(&state, header);
         if !state.rules.spec_id.is_enabled_in(SpecId::LONDON) || state.base_fee == 0 {
             fees.base_fee = 0;
         }
@@ -398,11 +431,11 @@ impl FeeManager {
         &self,
         header: &H,
     ) -> u64 {
-        let rules = self.state.read().rules;
-        if !rules.spec_id.is_enabled_in(SpecId::LONDON) {
+        let state = *self.state.read();
+        if !state.rules.spec_id.is_enabled_in(SpecId::LONDON) {
             return 0;
         }
-        calculate_parent_header_fees(rules, header).base_fee
+        calculate_parent_header_fees(&state, header).base_fee
     }
 
     /// Returns all fee metadata inherited from a parent header without applying the configured
@@ -411,9 +444,9 @@ impl FeeManager {
         &self,
         header: &H,
     ) -> ParentHeaderFees {
-        let rules = self.state.read().rules;
-        let mut fees = calculate_parent_header_fees(rules, header);
-        if !rules.spec_id.is_enabled_in(SpecId::LONDON) {
+        let state = *self.state.read();
+        let mut fees = calculate_parent_header_fees(&state, header);
+        if !state.rules.spec_id.is_enabled_in(SpecId::LONDON) {
             fees.base_fee = 0;
         }
         fees
@@ -437,20 +470,24 @@ impl FeeManager {
 }
 
 fn calculate_next_block_base_fee_per_gas(
-    rules: FeeRules,
+    state: &FeeState,
     gas_used: u64,
     gas_limit: u64,
     last_fee_per_gas: u64,
 ) -> u64 {
     // Tempo replaces EIP-1559 with its own hardfork-specific base fee rules.
-    if let Some(hardfork) = rules.tempo_hardfork {
+    if let Some(hardfork) = state.rules.tempo_hardfork {
         return tempo_next_block_base_fee(hardfork, gas_used, last_fee_per_gas);
     }
-    calc_next_block_base_fee(gas_used, gas_limit, last_fee_per_gas, rules.base_fee.params())
+    // Monad replaces EIP-1559 with its own base fee controller.
+    if let Some(monad) = state.monad {
+        return monad.next_block(gas_limit, gas_used, last_fee_per_gas).0;
+    }
+    calc_next_block_base_fee(gas_used, gas_limit, last_fee_per_gas, state.rules.base_fee.params())
 }
 
-fn calculate_parent_header_fees<H: BlockHeader>(rules: FeeRules, header: &H) -> ParentHeaderFees {
-    if let Some(hardfork) = rules.tempo_hardfork {
+fn calculate_parent_header_fees<H: BlockHeader>(state: &FeeState, header: &H) -> ParentHeaderFees {
+    if let Some(hardfork) = state.rules.tempo_hardfork {
         return ParentHeaderFees {
             base_fee: tempo_next_block_base_fee(
                 hardfork,
@@ -460,7 +497,15 @@ fn calculate_parent_header_fees<H: BlockHeader>(rules: FeeRules, header: &H) -> 
             ..Default::default()
         };
     }
-    rules.base_fee.parent_header_fees(header)
+    if let Some(monad) = state.monad {
+        let (base_fee, monad) = monad.next_block(
+            header.gas_limit(),
+            header.gas_used(),
+            header.base_fee_per_gas().unwrap_or_default(),
+        );
+        return ParentHeaderFees { base_fee, monad: Some(monad), ..Default::default() };
+    }
+    state.rules.base_fee.parent_header_fees(header)
 }
 
 /// Computes the next block's base fee for a Tempo chain.

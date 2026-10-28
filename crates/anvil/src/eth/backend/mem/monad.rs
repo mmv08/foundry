@@ -16,7 +16,7 @@ use crate::eth::{
         },
     },
     error::{BlockchainError, InvalidTransactionError},
-    fees::FeeManager,
+    fees::{FeeManager, MonadBaseFeeState},
     pool::transactions::PoolTransaction,
 };
 use alloy_consensus::{
@@ -82,6 +82,7 @@ pub(super) struct ForkReplay {
     source_chain_id: u64,
     timestamp: u64,
     inferred_hardfork: bool,
+    base_fee_state: MonadBaseFeeState,
 }
 
 impl ForkReplay {
@@ -104,6 +105,7 @@ impl ForkReplay {
             std::mem::take(&mut self.participants),
             self.execution_chain_id,
             self.hardfork,
+            self.base_fee_state,
         );
     }
 }
@@ -301,6 +303,7 @@ impl<N: Network> Backend<N> {
             source_chain_id,
             timestamp,
             inferred_hardfork: explicit_hardfork.is_none(),
+            base_fee_state: self.fees.monad_base_fee_state().unwrap_or_default(),
         }))
     }
 
@@ -375,35 +378,29 @@ impl<N: Network> Backend<N> {
         let fees = self.fees.detached();
         fees.set_execution_rules(spec_id, BaseFeeParams::ethereum(), None);
         fees.set_blob_params(blob_params);
-        // The fee manager stores values for the next block. Seed it with the retained block while
-        // deriving those values so the zero-base-fee sentinel and Osaka blob target are applied to
-        // the correct parent.
-        fees.set_base_fee(block_base_fee);
-        let (next_block_base_fee, next_block_excess_blob_gas) = if is_fork_root {
+        // The fee manager stores values for the next block: the base fee and controller state the
+        // retained block's child inherits, and the Osaka blob target applied to the retained block.
+        let (next_block_fees, _) = self.next_block_fees_after(&common_block.header);
+        let next_block_excess_blob_gas = if is_fork_root {
             if let Some(child) = self.get_block(common_block.header.number().saturating_add(1)) {
-                (
-                    child.header.base_fee_per_gas().unwrap_or_default(),
-                    child.header.excess_blob_gas().unwrap_or_default(),
-                )
+                child.header.excess_blob_gas().unwrap_or_default()
             } else {
-                let snapshot = self.fees.snapshot();
-                (snapshot.base_fee, snapshot.blob_excess_gas_and_price.excess_blob_gas)
+                self.fees.snapshot().blob_excess_gas_and_price.excess_blob_gas
             }
         } else {
-            (
-                fees.get_next_block_base_fee_from_header(&common_block.header),
-                blob_params.next_block_excess_blob_gas_osaka(
-                    common_block.header.excess_blob_gas.unwrap_or_default(),
-                    common_block.header.blob_gas_used.unwrap_or_default(),
-                    block_base_fee,
-                ),
+            blob_params.next_block_excess_blob_gas_osaka(
+                common_block.header.excess_blob_gas.unwrap_or_default(),
+                common_block.header.blob_gas_used.unwrap_or_default(),
+                block_base_fee,
             )
         };
-        fees.set_base_fee(next_block_base_fee);
-        fees.set_blob_excess_gas_and_price(BlobExcessGasAndPrice::new(
-            next_block_excess_blob_gas,
-            blob_params.update_fraction as u64,
-        ));
+        fees.set_next_block_fees(
+            &next_block_fees,
+            BlobExcessGasAndPrice::new(
+                next_block_excess_blob_gas,
+                blob_params.update_fraction as u64,
+            ),
+        );
 
         Some(MonadRollbackProfile {
             hardfork,
@@ -937,10 +934,15 @@ pub(super) fn store_block_metadata<N: Network>(
     participants: MonadBlockParticipants,
     execution_chain_id: u64,
     hardfork: FoundryHardfork,
+    base_fee_state: MonadBaseFeeState,
 ) {
     storage.monad_block_participants.insert(block_hash, participants);
     storage.monad_block_replay_profiles.insert(
         block_hash,
-        MonadBlockReplayProfile { execution_chain_id, hardfork: MonadHardfork::from(hardfork) },
+        MonadBlockReplayProfile {
+            execution_chain_id,
+            hardfork: MonadHardfork::from(hardfork),
+            base_fee_state,
+        },
     );
 }

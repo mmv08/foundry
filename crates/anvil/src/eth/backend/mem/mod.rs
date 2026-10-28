@@ -36,7 +36,10 @@ use crate::{
             validate::TransactionValidator,
         },
         error::{BlockchainError, ErrDetail, InvalidTransactionError},
-        fees::{FeeDetails, FeeManager, FeeSnapshot, MIN_SUGGESTED_PRIORITY_FEE},
+        fees::{
+            FeeDetails, FeeManager, FeeSnapshot, MIN_SUGGESTED_PRIORITY_FEE, MonadBaseFeeState,
+            ParentHeaderFees,
+        },
         macros::node_info,
         pool::transactions::PoolTransaction,
         preserve_simulation_request_fields,
@@ -2055,15 +2058,15 @@ impl<N: Network> Backend<N> {
         block
     }
 
-    /// Returns the base fee and blob excess gas that the child of `parent` inherits.
+    /// Returns the fees and blob excess gas that the child of `parent` inherits.
     ///
     /// Derives the zero-base-fee sentinel from `parent` rather than the live fee state. A local
     /// genesis header may not record the fees seeded for its child, so those come from the mined
     /// child, or from the live fee state when no child has been mined yet.
     pub(crate) fn next_block_fees_after(
         &self,
-        parent: &impl BlockHeader,
-    ) -> (u64, BlobExcessGasAndPrice) {
+        parent: &FoundryHeader,
+    ) -> (ParentHeaderFees, BlobExcessGasAndPrice) {
         let blob_params = self.fees.blob_params();
         let update_fraction = blob_params.update_fraction as u64;
         let is_fork_root =
@@ -2071,10 +2074,27 @@ impl<N: Network> Backend<N> {
         if is_fork_root || (!self.is_fork() && parent.number() == self.genesis_number()) {
             let Some(child) = self.get_block(parent.number() + 1) else {
                 let fees = self.fees.snapshot();
-                return (fees.base_fee, fees.blob_excess_gas_and_price);
+                return (
+                    ParentHeaderFees {
+                        base_fee: fees.base_fee,
+                        monad: fees.monad,
+                        ..Default::default()
+                    },
+                    fees.blob_excess_gas_and_price,
+                );
             };
+            let monad = self.fees.monad_base_fee_state().map(|_| {
+                Self::monad_base_fee_state_of(
+                    &self.blockchain.storage.read(),
+                    child.header.hash_slow(),
+                )
+            });
             return (
-                child.header.base_fee_per_gas().unwrap_or_default(),
+                ParentHeaderFees {
+                    base_fee: child.header.base_fee_per_gas().unwrap_or_default(),
+                    monad,
+                    ..Default::default()
+                },
                 BlobExcessGasAndPrice::new(
                     child.header.excess_blob_gas().unwrap_or_default(),
                     update_fraction,
@@ -2083,18 +2103,31 @@ impl<N: Network> Backend<N> {
         }
         let base_fee = parent.base_fee_per_gas().unwrap_or_default();
         let excess_blob_gas = parent.excess_blob_gas().unwrap_or_default();
-        let next_base_fee = if base_fee == 0 {
-            0
-        } else {
-            self.fees.calculate_next_block_base_fee_from_header(parent)
-        };
+        let parent_monad =
+            Self::monad_base_fee_state_of(&self.blockchain.storage.read(), parent.hash_slow());
+        let mut next_fees =
+            self.fees.with_monad_base_fee_state(parent_monad).calculate_parent_header_fees(parent);
+        if base_fee == 0 {
+            next_fees.base_fee = 0;
+        }
         let next_excess_blob_gas = self.networks.next_block_blob_excess_gas(
             blob_params,
             excess_blob_gas,
             parent.blob_gas_used().unwrap_or_default(),
             base_fee,
         );
-        (next_base_fee, BlobExcessGasAndPrice::new(next_excess_blob_gas, update_fraction))
+        (next_fees, BlobExcessGasAndPrice::new(next_excess_blob_gas, update_fraction))
+    }
+
+    /// Returns the Monad base fee controller state a stored block carries, or Monad's genesis
+    /// state for a block without a record, such as the genesis or fork block.
+    #[cfg_attr(not(feature = "monad"), allow(unused_variables))]
+    fn monad_base_fee_state_of(storage: &BlockchainStorage<N>, hash: B256) -> MonadBaseFeeState {
+        #[cfg(feature = "monad")]
+        if let Some(profile) = storage.monad_block_replay_profiles.get(&hash) {
+            return profile.base_fee_state;
+        }
+        MonadBaseFeeState::default()
     }
 
     /// Returns the environment for the next block
@@ -2124,6 +2157,7 @@ impl<N: Network> Backend<N> {
             let fallback = crate::eth::backend::db::MonadBlockReplayProfile {
                 execution_chain_id: evm_env.cfg_env.chain_id,
                 hardfork: self.monad_hardfork(),
+                base_fee_state: Default::default(),
             };
             let profile = self
                 .blockchain
@@ -4661,6 +4695,13 @@ impl<N: Network> Backend<N> {
                 drop(env);
                 fees.set_base_fee(next_base_fee);
             }
+            // Monad's base fee controller takes its first step from the genesis block.
+            if fees.monad_base_fee_state().is_some() {
+                let storage = blockchain.storage.read();
+                if let Some(genesis) = storage.blocks.get(&storage.genesis_hash) {
+                    fees.set_next_block_base_fee(&fees.get_parent_header_fees(&genesis.header));
+                }
+            }
         }
 
         let start_timestamp = if let Some(fork) = fork.read().as_ref() {
@@ -5483,13 +5524,14 @@ impl<N: Network> Backend<N> {
         staged_fees.set_blob_params(local_blob_params);
         staged_fees.set_blob_excess_gas_and_price(local_blob_excess_gas_and_price);
 
-        // Explicit local configuration always wins, while Tempo configuration uses the
-        // hardfork's own seed. An implicit in-memory Ethereum chain otherwise keeps its live base
-        // fee in the reset genesis; returning from a fork restores the local default instead of
-        // leaking remote fee state. Compute this up front so the env, storage, and fee manager all
-        // agree.
-        let preserve_live_base_fee =
-            !reset_from_fork && !local_base_fee_is_explicit && local_tempo_hardfork.is_none();
+        // Explicit local configuration always wins, while Tempo and Monad configurations use their
+        // own seed. An implicit in-memory Ethereum chain otherwise keeps its live base fee in the
+        // reset genesis; returning from a fork restores the local default instead of leaking remote
+        // fee state. Compute this up front so the env, storage, and fee manager all agree.
+        let preserve_live_base_fee = !reset_from_fork
+            && !local_base_fee_is_explicit
+            && local_tempo_hardfork.is_none()
+            && !self.networks.is_monad();
         let genesis_base_fee =
             if preserve_live_base_fee { staged_fees.base_fee() } else { local_base_fee };
 
@@ -5519,11 +5561,18 @@ impl<N: Network> Backend<N> {
         let header = genesis_header(&staged_env, base_fee, genesis_timestamp, genesis_number);
         let staged_storage = BlockchainStorage::new(foundry_header(&self.networks, header));
 
-        // Seed the next block's fee state. Tempo always advances through its hardfork rule, an
-        // implicit in-memory Ethereum reset restores Anvil's default, and explicit or
+        // Seed the next block's fee state. Tempo always advances through its hardfork rule, Monad
+        // takes its controller's first step from a genesis block that carries zero controller
+        // state, an implicit in-memory Ethereum reset restores Anvil's default, and explicit or
         // fork-to-memory Ethereum resets retain the local configured value.
         staged_fees.set_base_fee(genesis_base_fee);
-        if staged_fees.is_eip1559() {
+        if staged_fees.monad_base_fee_state().is_some() {
+            staged_fees.set_monad_base_fee_state(MonadBaseFeeState::default());
+            if let Some(genesis) = staged_storage.blocks.get(&staged_storage.genesis_hash) {
+                staged_fees
+                    .set_next_block_base_fee(&staged_fees.get_parent_header_fees(&genesis.header));
+            }
+        } else if staged_fees.is_eip1559() {
             let next_base_fee = if staged_fees.tempo_hardfork().is_some() {
                 staged_fees.get_next_block_base_fee_per_gas(
                     0,
@@ -6115,7 +6164,7 @@ where
         if self.is_optimism() {
             self.fees.set_optimism_base_fee_rules(header.extra_data());
         }
-        let next_block_base_fee = self.fees.get_next_block_base_fee_from_header(&header);
+        let next_block_fees = self.fees.get_parent_header_fees(&header);
         let blob_params = self.fees.blob_params();
         let next_block_excess_blob_gas = self.networks.next_block_blob_excess_gas(
             blob_params,
@@ -6123,11 +6172,13 @@ where
             header.blob_gas_used.unwrap_or_default(),
             header.base_fee_per_gas.unwrap_or_default(),
         );
-        self.fees.set_base_fee(next_block_base_fee);
-        self.fees.set_blob_excess_gas_and_price(BlobExcessGasAndPrice::new(
-            next_block_excess_blob_gas,
-            blob_params.update_fraction as u64,
-        ));
+        self.fees.set_next_block_fees(
+            &next_block_fees,
+            BlobExcessGasAndPrice::new(
+                next_block_excess_blob_gas,
+                blob_params.update_fraction as u64,
+            ),
+        );
         drop(db);
         self.notify_on_new_block(header.into_inner(), block_hash);
 
@@ -6379,7 +6430,7 @@ where
                 not_yet_valid,
                 block_hash,
                 parent_state,
-                next_block_base_fee,
+                next_block_fees,
                 next_block_blob_fees,
                 block_access_list,
             ) = {
@@ -6530,7 +6581,7 @@ where
                 self.cheats.consume_next_block_overrides(&next_block);
 
                 let header = &block_info.block.header;
-                let next_block_base_fee = self.fees.get_next_block_base_fee_from_header(header);
+                let next_block_fees = self.fees.get_parent_header_fees(header);
                 let next_block_excess_blob_gas = self.networks.next_block_blob_excess_gas(
                     self.fees.blob_params(),
                     header.excess_blob_gas.unwrap_or_default(),
@@ -6551,7 +6602,7 @@ where
                     not_yet_valid,
                     block_hash,
                     parent_state,
-                    next_block_base_fee,
+                    next_block_fees,
                     next_block_blob_fees,
                     block_access_list,
                 )
@@ -6627,6 +6678,7 @@ where
                     participants,
                     execution_chain_id,
                     hardfork,
+                    self.fees.monad_base_fee_state().unwrap_or_default(),
                 );
             }
 
@@ -6669,7 +6721,7 @@ where
             // lock cycle.
             evm_env.block_env.difficulty = U256::ZERO;
             *self.evm_env.write() = evm_env;
-            self.fees.set_next_block_fees(next_block_base_fee, next_block_blob_fees);
+            self.fees.set_next_block_fees(&next_block_fees, next_block_blob_fees);
             drop(storage);
             drop(db_guard);
 
@@ -7848,7 +7900,7 @@ where
         };
         let mut db = self.db.write().await;
         // Read the next-block fees while the retained block's child is still canonical.
-        let (next_base_fee, next_blob_fees) = self.next_block_fees_after(&common_block.header);
+        let (next_fees, next_blob_fees) = self.next_block_fees_after(&common_block.header);
         {
             // Collect the logs of the blocks that are about to be removed from the canonical
             // chain, while their transactions and receipts are still in storage
@@ -7897,7 +7949,7 @@ where
                     self.fees.blob_params().update_fraction as u64,
                 )
             });
-            self.fees.set_next_block_fees(next_base_fee, next_blob_fees);
+            self.fees.set_next_block_fees(&next_fees, next_blob_fees);
 
             self.time.reset(env.block_env.timestamp.saturating_to());
             // drop any pending next-block overrides so they do not leak into a block
@@ -8730,8 +8782,11 @@ impl<N: Network<ReceiptEnvelope = FoundryReceiptEnvelope>> Backend<N> {
             }
         }
 
+        let head_fees = self
+            .fees
+            .with_monad_base_fee_state(Self::monad_base_fee_state_of(&storage, storage.best_hash));
         let next_fees = selected_header.as_ref().map(|header| {
-            let parent_fees = self.fees.get_parent_header_fees(header);
+            let parent_fees = head_fees.get_parent_header_fees(header);
             let blob_params = self.fees.blob_params();
             let next_block_excess_blob_gas = self.networks.next_block_blob_excess_gas(
                 blob_params,
@@ -8815,8 +8870,7 @@ impl<N: Network<ReceiptEnvelope = FoundryReceiptEnvelope>> Backend<N> {
             if self.is_optimism() {
                 self.fees.set_optimism_base_fee_rules(&parent_fees.extra_data);
             }
-            self.fees.set_base_fee(parent_fees.base_fee);
-            self.fees.set_blob_excess_gas_and_price(blob_excess_gas_and_price);
+            self.fees.set_next_block_fees(&parent_fees, blob_excess_gas_and_price);
         }
 
         db.set_block_hashes(block_hashes);

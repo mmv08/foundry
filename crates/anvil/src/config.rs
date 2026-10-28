@@ -11,7 +11,7 @@ use crate::{
             tempo_consensus::TempoConsensus,
             time::duration_since_unix_epoch,
         },
-        fees::{INITIAL_BASE_FEE, INITIAL_GAS_PRICE},
+        fees::{INITIAL_BASE_FEE, INITIAL_GAS_PRICE, MONAD_MIN_BASE_FEE, MonadBaseFeeState},
         miner::INSTANT_COALESCE_WINDOW,
         pool::transactions::TransactionOrder,
     },
@@ -794,10 +794,13 @@ impl NodeConfig {
 
     /// Returns the base fee to use.
     ///
-    /// In Tempo mode, uses the hardfork-specific base fee (10 gwei pre-T1, 20 gwei T1+).
+    /// In Tempo mode, uses the hardfork-specific base fee (10 gwei pre-T1, 20 gwei T1+). In Monad
+    /// mode, uses Monad's minimum base fee of 100 gwei.
     pub fn get_base_fee(&self) -> u64 {
         let default = if self.networks.is_tempo() {
             tempo_default_base_fee(TempoHardfork::from(self.get_hardfork()))
+        } else if self.networks.is_monad() {
+            MONAD_MIN_BASE_FEE
         } else {
             INITIAL_BASE_FEE
         };
@@ -1591,6 +1594,10 @@ impl NodeConfig {
         if self.networks.is_optimism() {
             fees.set_optimism_hardfork(self.get_hardfork().into());
         }
+        // Monad's genesis block carries zero base fee controller state.
+        if self.networks.is_monad() {
+            fees.set_monad_base_fee_state(MonadBaseFeeState::default());
+        }
 
         let (db, fork, fork_transaction_replay) =
             if let Some(eth_rpc_url) = self.fork_urls.first().cloned() {
@@ -2224,6 +2231,11 @@ latest block number: {latest_block}"
         if self.networks.is_optimism() {
             fees.set_optimism_base_fee_rules(block.header.extra_data());
         }
+        // Monad keeps the controller state in its consensus header, which RPC does not expose, so
+        // the fork block carries Monad's genesis state.
+        if self.networks.is_monad() {
+            fees.set_monad_base_fee_state(MonadBaseFeeState::default());
+        }
 
         // if not set explicitly we use the base fee of the latest block
         self.base_fee = fork_overrides.base_fee.or_else(|| block.header.base_fee_per_gas());
@@ -2233,8 +2245,8 @@ latest block number: {latest_block}"
             // This is the base fee of the current block, but we need the base fee of the next
             // block.
             fees.set_base_fee(base_fee);
-            let next_block_base_fee = fees.get_next_block_base_fee_from_header(&block.header);
-            fees.set_base_fee(next_block_base_fee);
+            let next_block_fees = fees.get_parent_header_fees(&block.header);
+            fees.set_next_block_base_fee(&next_block_fees);
         } else {
             fees.set_base_fee(self.get_base_fee());
         }
