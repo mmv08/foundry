@@ -1791,6 +1791,64 @@ async fn monad_base_fee_follows_monad_controller() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn monad_simulate_base_fee_matches_mined_blocks() {
+    let (api, handle) = spawn(monad_nine_config().with_gas_limit(Some(50_000))).await;
+    let provider = handle.http_provider();
+    let accounts = provider.get_accounts().await.unwrap();
+    let transfer = |from, nonce| {
+        TransactionRequest::default()
+            .with_from(from)
+            .with_to(accounts[2])
+            .with_nonce(nonce)
+            .with_gas_limit(21_000)
+            .with_max_fee_per_gas(2 * MONAD_GAS_PRICE)
+            .with_max_priority_fee_per_gas(1_000_000_000)
+    };
+
+    // Every block uses 42,000 gas, above the 40,000 target, so each base fee depends on the
+    // controller state its parent carries.
+    api.anvil_set_auto_mine(false).await.unwrap();
+    for nonce in 0..2 {
+        for from in &accounts[..2] {
+            let _ = provider.send_transaction(transfer(*from, nonce).into()).await.unwrap();
+        }
+        api.mine_one().await.unwrap();
+    }
+    let simulated = api
+        .simulate_v1(
+            SimulatePayload {
+                block_state_calls: (2..4)
+                    .map(|nonce| SimBlock {
+                        calls: accounts[..2].iter().map(|from| transfer(*from, nonce)).collect(),
+                        ..Default::default()
+                    })
+                    .collect(),
+                validation: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    for nonce in 2..4 {
+        for from in &accounts[..2] {
+            let _ = provider.send_transaction(transfer(*from, nonce).into()).await.unwrap();
+        }
+        api.mine_one().await.unwrap();
+    }
+
+    let mut mined = Vec::new();
+    for number in 3..=4 {
+        let block =
+            provider.get_block_by_number(BlockNumberOrTag::Number(number)).await.unwrap().unwrap();
+        mined.push(block.header.base_fee_per_gas);
+    }
+    let simulated =
+        simulated.iter().map(|block| block.inner.header.base_fee_per_gas).collect::<Vec<_>>();
+    assert_eq!(simulated, mined);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn monad_rejects_eip4844_blob_transactions() {
     let config = monad_nine_config();
     let (_api, handle) = spawn(config).await;
@@ -2413,13 +2471,13 @@ async fn monad_fork_rollback_to_root_preserves_startup_overrides() {
     let (source_api, source) = spawn(
         monad_nine_config()
             .with_no_mining(true)
-            .with_base_fee(Some(MONAD_MIN_BASE_FEE))
+            .with_base_fee(Some(1_000_000_000))
             .with_gas_limit(Some(30_000_000)),
     )
     .await;
     source_api.mine_one().await.unwrap();
     let root = source.http_provider().get_block(1.into()).await.unwrap().unwrap();
-    assert_eq!(root.header.base_fee_per_gas, Some(MONAD_MIN_BASE_FEE));
+    assert_eq!(root.header.base_fee_per_gas, Some(1_000_000_000));
     assert_eq!(root.header.gas_limit, 30_000_000);
 
     let (api, handle) = spawn(

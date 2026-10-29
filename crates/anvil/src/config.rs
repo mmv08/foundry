@@ -1594,10 +1594,6 @@ impl NodeConfig {
         if self.networks.is_optimism() {
             fees.set_optimism_hardfork(self.get_hardfork().into());
         }
-        // Monad's genesis block carries zero base fee controller state.
-        if self.networks.is_monad() {
-            fees.set_monad_base_fee_state(MonadBaseFeeState::default());
-        }
 
         let (db, fork, fork_transaction_replay) =
             if let Some(eth_rpc_url) = self.fork_urls.first().cloned() {
@@ -2231,11 +2227,6 @@ latest block number: {latest_block}"
         if self.networks.is_optimism() {
             fees.set_optimism_base_fee_rules(block.header.extra_data());
         }
-        // Monad keeps the controller state in its consensus header, which RPC does not expose, so
-        // the fork block carries Monad's genesis state.
-        if self.networks.is_monad() {
-            fees.set_monad_base_fee_state(MonadBaseFeeState::default());
-        }
 
         // if not set explicitly we use the base fee of the latest block
         self.base_fee = fork_overrides.base_fee.or_else(|| block.header.base_fee_per_gas());
@@ -2245,8 +2236,13 @@ latest block number: {latest_block}"
             // This is the base fee of the current block, but we need the base fee of the next
             // block.
             fees.set_base_fee(base_fee);
-            let next_block_fees = fees.get_parent_header_fees(&block.header);
-            fees.set_next_block_base_fee(&next_block_fees);
+            let mut next_block_base_fee = fees.get_next_block_base_fee_from_header(&block.header);
+            // RPC does not expose the controller state that Monad keeps in its consensus header, so
+            // the fork block carries Monad's genesis state.
+            if self.networks.is_monad() && next_block_base_fee != 0 {
+                next_block_base_fee = MonadBaseFeeState::default().child(&block.header).0;
+            }
+            fees.set_base_fee(next_block_base_fee);
         } else {
             fees.set_base_fee(self.get_base_fee());
         }

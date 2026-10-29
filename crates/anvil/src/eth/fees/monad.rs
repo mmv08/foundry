@@ -3,6 +3,7 @@
 //! Ports `compute_base_fee` from monad-bft's `monad-tfm` crate. Monad keeps the controller's
 //! trend and moment in its consensus header, not in the Ethereum header.
 
+use alloy_consensus::BlockHeader;
 use alloy_primitives::aliases::I512;
 use serde::{Deserialize, Serialize};
 
@@ -30,12 +31,22 @@ pub struct MonadBaseFeeState {
 }
 
 impl MonadBaseFeeState {
+    /// Returns the base fee and controller state of the child of `parent`, a block that carries
+    /// `self`.
+    pub fn child(self, parent: &impl BlockHeader) -> (u64, Self) {
+        self.next_block(
+            parent.gas_limit(),
+            parent.gas_used(),
+            parent.base_fee_per_gas().unwrap_or_default(),
+        )
+    }
+
     /// Returns the base fee and controller state of the child of a block that carries `self`.
     ///
-    /// Monad measures `gas_used` as the sum of the transaction gas limits. The arithmetic runs on
-    /// 512-bit integers, so it matches Monad wherever Monad's 64-bit arithmetic holds, and
-    /// saturates on the larger gas limits that anvil allows.
-    pub fn next_block(self, gas_limit: u64, gas_used: u64, base_fee: u64) -> (u64, Self) {
+    /// Monad counts a block's gas as the sum of its transaction gas limits, which its headers
+    /// report as gas used. The arithmetic runs on 512-bit integers, so it matches Monad wherever
+    /// Monad's 64-bit arithmetic holds, and saturates on the larger gas limits that anvil allows.
+    fn next_block(self, gas_limit: u64, gas_used: u64, base_fee: u64) -> (u64, Self) {
         let gas_limit = int(gas_limit);
         let gas_used = int(gas_used).min(gas_limit);
         let trend = int(self.trend);
